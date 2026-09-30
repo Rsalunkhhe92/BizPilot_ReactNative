@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "AutoLedger",
+    "slug": "autoledger",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.autoledger.app",
+      "permissions": [
+        "READ_SMS"
+      ]
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-status-bar",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow BizPilot to detect your location so it can be recorded with each trip payment."
+        }
+      ],
+      "expo-audio"
+    ]
+  }
+}
