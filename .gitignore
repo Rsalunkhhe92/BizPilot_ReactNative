@@ -84,6 +84,5 @@ backend/
 # Expo
 .expo/
 
-# Admin dashboard build output / env
-admin-dashboard/dist/
-admin-dashboard/.env
+# Admin dashboard - now its own standalone git repository
+admin-dashboard/
