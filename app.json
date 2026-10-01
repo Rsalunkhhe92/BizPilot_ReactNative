@@ -5,6 +5,7 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
+    "icon": "./assets/icon.png",
     "assetBundlePatterns": [
       "**/*"
     ],
@@ -15,7 +16,11 @@
       "package": "com.autoledger.app",
       "permissions": [
         "READ_SMS"
-      ]
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#3730A3"
+      }
     },
     "web": {
       "bundler": "metro"
@@ -28,7 +33,9 @@
           "locationWhenInUsePermission": "Allow BizPilot to detect your location so it can be recorded with each trip payment."
         }
       ],
-      "expo-audio"
+      "expo-audio",
+      "expo-sharing",
+      "expo-secure-store"
     ]
   }
 }

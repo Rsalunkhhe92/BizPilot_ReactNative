@@ -7,6 +7,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Animated,
+  AppState,
   Easing,
   Image,
   Linking,
@@ -38,6 +39,9 @@ import {
   setAudioModeAsync,
 } from 'expo-audio';
 import * as FileSystem from 'expo-file-system/legacy';
+import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
+import * as SecureStore from 'expo-secure-store';
 import { detectUpiCredit } from './smsPayments';
 import { isSmsReaderAvailable, readInbox } from './modules/sms-reader';
 import { Language, LANGUAGE_LABELS, TranslationKey, translate } from './i18n';
@@ -128,6 +132,68 @@ function estimateTotalDistanceKm(driverTrips: { tripTimeMs: number; distanceKm: 
     gpsDistance += haversineKm(gpsPoints[i - 1].latitude!, gpsPoints[i - 1].longitude!, gpsPoints[i].latitude!, gpsPoints[i].longitude!);
   }
   return Math.round((odometerDistance + gpsDistance) * 10) / 10;
+}
+
+// Classifies an Open-Meteo WMO weather code into a driving-risk tier and a short
+// human label, for the route-safety advisory. Code table: https://open-meteo.com/en/docs
+// Buckets a set of timestamped amounts across a date range into chart bars - daily
+// bars for ranges up to 14 days (readable at that density), weekly bars beyond that
+// so a month/custom range doesn't cram 30+ skinny bars into one chart.
+function buildPeriodBuckets(records: { timeMs: number; amount: number }[], startISO: string, endISO: string) {
+  const start = new Date(startISO + 'T00:00:00');
+  const end = new Date(endISO + 'T00:00:00');
+  const totalDays = Math.max(1, Math.round((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1);
+  const daily = totalDays <= 14;
+  const bucketSpanDays = daily ? 1 : 7;
+  const buckets: { label: string; amount: number }[] = [];
+  const cursor = new Date(start);
+  let weekIdx = 1;
+  while (cursor.getTime() <= end.getTime()) {
+    const bucketStart = cursor.getTime();
+    const bucketEndDate = new Date(cursor);
+    bucketEndDate.setDate(bucketEndDate.getDate() + bucketSpanDays - 1);
+    const bucketEndMs = Math.min(bucketEndDate.getTime(), end.getTime()) + 24 * 60 * 60 * 1000;
+    const amount = records
+      .filter(r => r.timeMs >= bucketStart && r.timeMs < bucketEndMs)
+      .reduce((sum, r) => sum + r.amount, 0);
+    const label = daily ? cursor.toLocaleDateString('en-US', { day: 'numeric', month: 'short' }) : `W${weekIdx}`;
+    buckets.push({ label, amount });
+    cursor.setDate(cursor.getDate() + bucketSpanDays);
+    weekIdx++;
+  }
+  return buckets;
+}
+
+// Jan 1, 2023 was a Sunday - using it as a reference date lets us turn a plain
+// Date.getDay() index (0-6) into a locale-aware weekday name without a lookup table.
+function weekdayName(dow: number): string {
+  return new Date(2023, 0, dow + 1).toLocaleDateString(undefined, { weekday: 'long' });
+}
+
+function timeOfDayBucket(hour: number): 'morning' | 'afternoon' | 'evening' | 'night' {
+  if (hour < 5) return 'night';
+  if (hour < 12) return 'morning';
+  if (hour < 17) return 'afternoon';
+  if (hour < 21) return 'evening';
+  return 'night';
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function classifyWeatherRisk(code: number): {
+  severity: 'none' | 'mild' | 'severe';
+  labelKey: 'drv_weatherThunderstorm' | 'drv_weatherHeavy' | 'drv_weatherMild' | null;
+} {
+  if (code >= 95) return { severity: 'severe', labelKey: 'drv_weatherThunderstorm' };
+  if ([45, 48, 65, 67, 75, 82, 86].includes(code)) return { severity: 'severe', labelKey: 'drv_weatherHeavy' };
+  if ([51, 53, 55, 56, 57, 61, 63, 66, 71, 73, 77, 80, 81, 85].includes(code)) return { severity: 'mild', labelKey: 'drv_weatherMild' };
+  return { severity: 'none', labelKey: null };
 }
 
 type UserType = 'admin' | 'customer';
@@ -458,6 +524,23 @@ function describePieSlice(cx: number, cy: number, r: number, startAngle: number,
 
 const PIE_CHART_PALETTE = ['#EF4444', '#F97316', '#EAB308', '#8B5CF6', '#3B82F6', '#10B981', '#EC4899', '#6366F1'];
 
+// Auto-logout after this long with no interaction (foreground idle) or this long
+// backgrounded (app switched away / screen locked), whichever happens first.
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000;
+
+// PIN login: a device-local quick-unlock shortcut, not a separate server-side auth
+// method - the PIN just gates re-using the same email+DOB the device already proved
+// once, stored encrypted via the OS keystore (expo-secure-store), never in plain
+// AsyncStorage. Logging out of the app does NOT clear this - only "Disable PIN
+// Login" in Profile does - so quick re-entry survives normal logout/app restarts.
+const PIN_STORE_KEYS = {
+  pin: 'bizpilot_pin_code',
+  email: 'bizpilot_pin_email',
+  dob: 'bizpilot_pin_dob',
+  name: 'bizpilot_pin_name',
+};
+const PIN_SETUP_DECLINED_KEY = 'bizpilot_pin_setup_declined';
+
 
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
@@ -516,12 +599,186 @@ function CustomerAppContent() {
     setAdminNotice(null);
   }
 
+  // ---- Session timeout: auto-logout after SESSION_TIMEOUT_MS of either foreground
+  // idle (no touch anywhere in the app) or being backgrounded (app switched away /
+  // screen locked). Background duration is checked against a timestamp on resume
+  // rather than relying on a JS timer, since timers are paused/throttled while the
+  // app isn't in the foreground and can't be trusted to fire on schedule. ----
+  const lastActivityRef = useRef(Date.now());
+  const backgroundedAtRef = useRef<number | null>(null);
+
+  function registerActivity() {
+    lastActivityRef.current = Date.now();
+  }
+
+  function performSessionTimeout() {
+    handleLogout();
+    Alert.alert(t('session_timeoutTitle'), t('session_timeoutMessage'));
+  }
+
+  useEffect(() => {
+    if (!user) return;
+    registerActivity();
+    const interval = setInterval(() => {
+      if (Date.now() - lastActivityRef.current > SESSION_TIMEOUT_MS) {
+        performSessionTimeout();
+      }
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [user?.id]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'background' || nextState === 'inactive') {
+        backgroundedAtRef.current = Date.now();
+      } else if (nextState === 'active') {
+        if (user && backgroundedAtRef.current && Date.now() - backgroundedAtRef.current > SESSION_TIMEOUT_MS) {
+          performSessionTimeout();
+        } else {
+          registerActivity();
+        }
+        backgroundedAtRef.current = null;
+      }
+    });
+    return () => subscription.remove();
+  }, [user?.id]);
+
   // Login form state
   const [email, setEmail] = useState('');
   const [dob, setDob] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [loading, setLoading] = useState(false);
   const [adminNotice, setAdminNotice] = useState<string | null>(null);
+  const lastLoginCredentialsRef = useRef<{ email: string; dob: string; fullName: string } | null>(null);
+
+  // PIN login (device-local quick-unlock) state
+  const [pinLoginAvailable, setPinLoginAvailable] = useState(false);
+  const [showPinScreen, setShowPinScreen] = useState(false);
+  const [pinLoginName, setPinLoginName] = useState('');
+  const [pinInput, setPinInput] = useState('');
+  const [pinError, setPinError] = useState('');
+  const [pinUnlocking, setPinUnlocking] = useState(false);
+  const [showSetupPinModal, setShowSetupPinModal] = useState(false);
+  const [setupPinStep, setSetupPinStep] = useState<'enter' | 'confirm'>('enter');
+  const [setupPinValue, setSetupPinValue] = useState('');
+  const [setupPinConfirmValue, setSetupPinConfirmValue] = useState('');
+  const [setupPinError, setSetupPinError] = useState('');
+  const [setupPinSaving, setSetupPinSaving] = useState(false);
+
+  useEffect(() => {
+    SecureStore.getItemAsync(PIN_STORE_KEYS.pin).then(storedPin => {
+      if (storedPin) {
+        setPinLoginAvailable(true);
+        setShowPinScreen(true);
+        SecureStore.getItemAsync(PIN_STORE_KEYS.name).then(name => setPinLoginName(name || '')).catch(() => {});
+      }
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!user || pinLoginAvailable || !lastLoginCredentialsRef.current) return;
+    AsyncStorage.getItem(PIN_SETUP_DECLINED_KEY).then(declined => {
+      if (declined !== '1') {
+        setSetupPinStep('enter');
+        setSetupPinValue('');
+        setSetupPinConfirmValue('');
+        setSetupPinError('');
+        setShowSetupPinModal(true);
+      }
+    }).catch(() => {});
+  }, [user?.id, pinLoginAvailable]);
+
+  async function handlePinSubmit() {
+    if (pinInput.length < 4 || pinUnlocking) return;
+    setPinUnlocking(true);
+    setPinError('');
+    try {
+      const storedPin = await SecureStore.getItemAsync(PIN_STORE_KEYS.pin);
+      if (storedPin !== pinInput) {
+        setPinError(t('pin_incorrect'));
+        setPinInput('');
+        return;
+      }
+      const storedEmail = await SecureStore.getItemAsync(PIN_STORE_KEYS.email);
+      const storedDob = await SecureStore.getItemAsync(PIN_STORE_KEYS.dob);
+      if (!storedEmail || !storedDob) {
+        setPinError(t('pin_setupExpired'));
+        setShowPinScreen(false);
+        setPinLoginAvailable(false);
+        return;
+      }
+      const ok = await handleLogin(storedEmail, storedDob);
+      if (ok) {
+        setShowPinScreen(false);
+        setPinInput('');
+      } else {
+        setPinError(t('pin_loginFailed'));
+        setPinInput('');
+      }
+    } finally {
+      setPinUnlocking(false);
+    }
+  }
+
+  function handleUseFullLoginInstead() {
+    setShowPinScreen(false);
+    setPinInput('');
+    setPinError('');
+  }
+
+  async function handleSaveSetupPin() {
+    if (setupPinStep === 'enter') {
+      if (setupPinValue.length < 4) {
+        setSetupPinError(t('pin_tooShort'));
+        return;
+      }
+      setSetupPinError('');
+      setSetupPinStep('confirm');
+      return;
+    }
+    if (setupPinConfirmValue !== setupPinValue) {
+      setSetupPinError(t('pin_mismatch'));
+      setSetupPinConfirmValue('');
+      return;
+    }
+    const creds = lastLoginCredentialsRef.current;
+    if (!creds) {
+      setShowSetupPinModal(false);
+      return;
+    }
+    setSetupPinSaving(true);
+    try {
+      await SecureStore.setItemAsync(PIN_STORE_KEYS.pin, setupPinValue);
+      await SecureStore.setItemAsync(PIN_STORE_KEYS.email, creds.email);
+      await SecureStore.setItemAsync(PIN_STORE_KEYS.dob, creds.dob);
+      await SecureStore.setItemAsync(PIN_STORE_KEYS.name, creds.fullName);
+      setPinLoginAvailable(true);
+      setPinLoginName(creds.fullName);
+      setShowSetupPinModal(false);
+    } catch (e) {
+      console.error('Error saving PIN:', e);
+      setSetupPinError(t('pin_saveFailed'));
+    } finally {
+      setSetupPinSaving(false);
+    }
+  }
+
+  function handleSkipSetupPin() {
+    setShowSetupPinModal(false);
+    AsyncStorage.setItem(PIN_SETUP_DECLINED_KEY, '1').catch(() => {});
+  }
+
+  async function handleDisablePinLogin() {
+    await Promise.all([
+      SecureStore.deleteItemAsync(PIN_STORE_KEYS.pin),
+      SecureStore.deleteItemAsync(PIN_STORE_KEYS.email),
+      SecureStore.deleteItemAsync(PIN_STORE_KEYS.dob),
+      SecureStore.deleteItemAsync(PIN_STORE_KEYS.name),
+    ]).catch(() => {});
+    await AsyncStorage.removeItem(PIN_SETUP_DECLINED_KEY).catch(() => {});
+    setPinLoginAvailable(false);
+    setPinLoginName('');
+  }
 
   // Registration form state (mobile self-registration, writes to the same userdetails table
   // used by the admin dashboard's "Create customer" flow)
@@ -553,6 +810,24 @@ function CustomerAppContent() {
   const [fuelLogs, setFuelLogs] = useState<FuelLog[]>([]);
   const [driverFuelHistory, setDriverFuelHistory] = useState<{ totalCost: number; fuelTimeMs: number }[]>([]);
   const [selectedFuelDay, setSelectedFuelDay] = useState<number | null>(null);
+  const [routeSafetyAdvisory, setRouteSafetyAdvisory] = useState<{ severity: 'moderate' | 'high'; message: string } | null>(null);
+  const [navigateDestination, setNavigateDestination] = useState('');
+
+  // Driver Reports tab (week / month / custom date-range history + charts)
+  const [reportPeriod, setReportPeriod] = useState<'week' | 'month' | 'custom'>('week');
+  const [reportCustomStart, setReportCustomStart] = useState(formatDateISO(new Date(Date.now() - 6 * 24 * 60 * 60 * 1000)));
+  const [reportCustomEnd, setReportCustomEnd] = useState(formatDateISO(new Date()));
+  const [reportStartCalendarMonth, setReportStartCalendarMonth] = useState(new Date());
+  const [reportEndCalendarMonth, setReportEndCalendarMonth] = useState(new Date());
+  const [showReportStartPicker, setShowReportStartPicker] = useState(false);
+  const [showReportEndPicker, setShowReportEndPicker] = useState(false);
+  const [reportTrips, setReportTrips] = useState<{ fare: number; paymentMode: 'Cash' | 'UPI'; tripTimeMs: number; route: string; locationName: string }[]>([]);
+  const [reportFuelLogs, setReportFuelLogs] = useState<{ totalCost: number; fuelTimeMs: number; fuelType: string; station: string }[]>([]);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [selectedReportEarningsDay, setSelectedReportEarningsDay] = useState<number | null>(null);
+  const [selectedReportFuelDay, setSelectedReportFuelDay] = useState<number | null>(null);
+  const [selectedReportPeakBucket, setSelectedReportPeakBucket] = useState<number | null>(null);
+  const [reportExporting, setReportExporting] = useState(false);
   const [inventory, setInventory] = useState<InventoryItem[]>(INITIAL_INVENTORY);
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [inventoryTransactions, setInventoryTransactions] = useState<any[]>([]);
@@ -779,6 +1054,7 @@ function CustomerAppContent() {
   const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'bot'; text: string }[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [chatVoiceProcessing, setChatVoiceProcessing] = useState(false);
   const [serviceJobs] = useState<ServiceJob[]>(INITIAL_SERVICE_JOBS);
   const [collections] = useState<CollectionRecord[]>(INITIAL_COLLECTIONS);
 
@@ -1972,6 +2248,58 @@ function CustomerAppContent() {
     }
   }
 
+  // ---- Voice Q&A: speak a question instead of typing it. One Gemini call both
+  // transcribes the question and answers it using the same grounded data as the
+  // text chat, so the driver can ask "how much fuel this month" out loud. ----
+  async function handleStartChatVoiceRecording() {
+    if (!user?.id) return;
+    try {
+      const perm = await requestRecordingPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert(t('common_error'), t('drv_micPermissionDenied'));
+        return;
+      }
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      await voiceRecorder.prepareToRecordAsync();
+      voiceRecorder.record();
+      setTimeout(() => {
+        if (voiceRecorder.isRecording) handleStopChatVoiceRecording();
+      }, 8000);
+    } catch (e) {
+      console.error('Error starting chat voice recording:', e);
+      Alert.alert(t('common_error'), t('drv_voiceUnavailable'));
+    }
+  }
+
+  async function handleStopChatVoiceRecording() {
+    if (!user?.id || !voiceRecorder.isRecording) return;
+    try {
+      await voiceRecorder.stop();
+      const uri = voiceRecorder.uri;
+      if (!uri) {
+        Alert.alert(t('common_error'), t('drv_voiceUnavailable'));
+        return;
+      }
+      setChatVoiceProcessing(true);
+      const audioBase64 = await FileSystem.readAsStringAsync(uri, { encoding: 'base64' });
+      const res = await apiFetch('/api/assistant/voice-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerId: user.id, audioBase64, mimeType: 'audio/mp4' }),
+      });
+      const data = await res.json();
+      if (data.transcript) {
+        setChatMessages(prev => [...prev, { role: 'user', text: data.transcript }]);
+      }
+      setChatMessages(prev => [...prev, { role: 'bot', text: data.reply || data.error || "Sorry, I couldn't process that." }]);
+    } catch (e) {
+      console.error('Error processing chat voice recording:', e);
+      setChatMessages(prev => [...prev, { role: 'bot', text: 'Network error — please check your connection and try again.' }]);
+    } finally {
+      setChatVoiceProcessing(false);
+    }
+  }
+
   useEffect(() => {
     if (user && (activeTab === 'inventory' || activeTab === 'daily_collection' || activeTab === 'sales' || activeTab === 'home')) {
       loadInventoryData();
@@ -2631,6 +2959,7 @@ function CustomerAppContent() {
     { key: 'online_booking', label: t('trv_navBooking'), icon: '🎫', show: isTravelBusiness },
     { key: 'trips', label: t('nav_trips'), icon: '🗺️', show: hasFeature('trips') && !isTravelBusiness },
     { key: 'fuel', label: t('nav_fuelLog'), icon: '⛽', show: hasFeature('fuel') || isTravelBusiness },
+    { key: 'driver_reports', label: t('nav_driverReports'), icon: '📊', show: hasFeature('trips') && !isTravelBusiness },
     { key: 'inventory', label: t('nav_inventory'), icon: '📦', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'daily_collection', label: t('nav_dailyCollection'), icon: '💰', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'inventory_insights', label: t('nav_insights'), icon: '📊', show: hasFeature('inventory') || hasFeature('products') },
@@ -2774,7 +3103,7 @@ function CustomerAppContent() {
     }
   }
 
-  async function handleLogin(overrideEmail?: string, overrideDob?: string) {
+  async function handleLogin(overrideEmail?: string, overrideDob?: string): Promise<boolean> {
     setErrorMessage('');
     setAdminNotice(null);
 
@@ -2783,7 +3112,7 @@ function CustomerAppContent() {
 
     if (!loginEmail || !loginDob) {
       setErrorMessage('Please enter both registered email and date of birth.');
-      return;
+      return false;
     }
 
     setLoading(true);
@@ -2803,7 +3132,7 @@ function CustomerAppContent() {
       if (!response.ok) {
         const msg = typeof result === 'string' ? result : result?.message || 'Invalid email or date of birth.';
         setErrorMessage(msg);
-        return;
+        return false;
       }
 
       const userData = result.user;
@@ -2813,7 +3142,7 @@ function CustomerAppContent() {
         setAdminNotice(
           `Hello ${userData.fullName}. This mobile app is exclusively for BizPilot Customers. As an administrator, please manage operations via the BizPilot Admin Portal on the web.`
         );
-        return;
+        return false;
       }
 
       setUser({
@@ -2836,19 +3165,16 @@ function CustomerAppContent() {
       if ((userData.businessType || '').toLowerCase().includes('collection')) {
         setActiveTab('collection_records');
       }
+
+      lastLoginCredentialsRef.current = { email: loginEmail, dob: loginDob, fullName: userData.fullName };
+      return true;
     } catch (error) {
       console.error('Customer login error:', error);
       setErrorMessage('Cannot connect to BizPilot backend. Please ensure the server is active on port 5000.');
+      return false;
     } finally {
       setLoading(false);
     }
-  }
-
-  function handleQuickFill(demoEmail: string, demoDob: string) {
-    setEmail(demoEmail);
-    setDob(demoDob);
-    setErrorMessage('');
-    setAdminNotice(null);
   }
 
   function handleAddTransaction() {
@@ -3611,7 +3937,9 @@ function CustomerAppContent() {
   async function loadDriverTripsHistory() {
     if (!user?.id) return;
     try {
-      const res = await apiFetch(`/api/driver/trips?owner_id=${user.id}&days=7`);
+      // Fetches 8 weeks so the earnings-vs-usual comparison has enough same-weekday
+      // history; the last-7-days chart simply filters this down to its own window.
+      const res = await apiFetch(`/api/driver/trips?owner_id=${user.id}&days=56`);
       if (!res.ok) return;
       const data = await res.json();
       setDriverTripsHistory((data.trips || []).map((tr: any) => ({
@@ -3672,6 +4000,72 @@ function CustomerAppContent() {
     if (user?.id && !isTravelBusiness && hasFeature('fuel') && (activeTab === 'fuel' || activeTab === 'home')) loadDriverFuelLogs();
     if (user?.id && !isTravelBusiness && hasFeature('fuel') && activeTab === 'fuel') loadDriverFuelLogsHistory();
   }, [user?.id, activeTab]);
+
+  async function loadDriverReportData() {
+    if (!user?.id) return;
+    setReportLoading(true);
+    try {
+      const rangeQuery =
+        reportPeriod === 'week'
+          ? 'days=7'
+          : reportPeriod === 'month'
+          ? 'days=30'
+          : `start_date=${reportCustomStart}&end_date=${reportCustomEnd}`;
+
+      const [tripsRes, fuelRes] = await Promise.all([
+        apiFetch(`/api/driver/trips?owner_id=${user.id}&${rangeQuery}`),
+        apiFetch(`/api/driver/fuel-logs?owner_id=${user.id}&${rangeQuery}`),
+      ]);
+      const tripsData = tripsRes.ok ? await tripsRes.json() : { trips: [] };
+      const fuelData = fuelRes.ok ? await fuelRes.json() : { fuelLogs: [] };
+
+      setReportTrips((tripsData.trips || []).map((tr: any) => ({
+        fare: tr.fare,
+        paymentMode: tr.paymentMode,
+        tripTimeMs: new Date(tr.tripTime).getTime(),
+        route: tr.route || '',
+        locationName: tr.locationName || '',
+      })));
+      setReportFuelLogs((fuelData.fuelLogs || []).map((f: any) => ({
+        totalCost: f.totalCost || 0,
+        fuelTimeMs: new Date(f.fuelTime).getTime(),
+        fuelType: f.fuelType,
+        station: f.station || '',
+      })));
+    } catch (e) {
+      console.error('Error loading report data:', e);
+    } finally {
+      setReportLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (user?.id && !isTravelBusiness && hasFeature('trips') && activeTab === 'driver_reports') {
+      if (reportPeriod !== 'custom' || (reportCustomStart && reportCustomEnd && reportCustomStart <= reportCustomEnd)) {
+        loadDriverReportData();
+      }
+    }
+  }, [user?.id, activeTab, reportPeriod, reportCustomStart, reportCustomEnd]);
+
+  function openReportStartPicker() {
+    const parsed = /^\d{4}-\d{2}-\d{2}$/.test(reportCustomStart) ? new Date(reportCustomStart + 'T00:00:00') : new Date();
+    setReportStartCalendarMonth(isNaN(parsed.getTime()) ? new Date() : parsed);
+    setShowReportStartPicker(true);
+  }
+
+  function openReportEndPicker() {
+    const parsed = /^\d{4}-\d{2}-\d{2}$/.test(reportCustomEnd) ? new Date(reportCustomEnd + 'T00:00:00') : new Date();
+    setReportEndCalendarMonth(isNaN(parsed.getTime()) ? new Date() : parsed);
+    setShowReportEndPicker(true);
+  }
+
+  function shiftReportStartCalendarMonth(delta: number) {
+    setReportStartCalendarMonth(prev => new Date(prev.getFullYear(), prev.getMonth() + delta, 1));
+  }
+
+  function shiftReportEndCalendarMonth(delta: number) {
+    setReportEndCalendarMonth(prev => new Date(prev.getFullYear(), prev.getMonth() + delta, 1));
+  }
 
   // ---- Driver dashboard charts (Payment Mix + Last 7 Days Earnings) ----
   function renderPaymentMixChart(cashTotal: number, upiTotal: number) {
@@ -5117,6 +5511,76 @@ function CustomerAppContent() {
     }
   }
 
+  // ---- AI Route Safety advisory (Home tab, passive) ----
+  // Combines time-of-day (night driving) with current local weather (free, no API
+  // key needed via Open-Meteo) into a simple drive-carefully banner. Never blocks
+  // or alerts on failure - permission denied or network error just means no banner.
+  async function loadRouteSafetyAdvisory() {
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        setRouteSafetyAdvisory(null);
+        return;
+      }
+      const position = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Low });
+      const { latitude, longitude } = position.coords;
+      const res = await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=is_day,weather_code`
+      );
+      if (!res.ok) {
+        setRouteSafetyAdvisory(null);
+        return;
+      }
+      const data = await res.json();
+      const isNight = data?.current?.is_day === 0;
+      const weatherCode = data?.current?.weather_code ?? 0;
+      const weather = classifyWeatherRisk(weatherCode);
+      const weatherLabel: string = weather.labelKey ? t(weather.labelKey) : '';
+
+      if (weather.severity === 'severe') {
+        setRouteSafetyAdvisory({
+          severity: 'high',
+          message: isNight ? t('drv_safetyNightSevere', { weather: weatherLabel }) : t('drv_safetyDaySevere', { weather: weatherLabel }),
+        });
+      } else if (isNight && weather.severity === 'mild') {
+        setRouteSafetyAdvisory({ severity: 'high', message: t('drv_safetyNightMild', { weather: weatherLabel }) });
+      } else if (weather.severity === 'mild') {
+        setRouteSafetyAdvisory({ severity: 'moderate', message: t('drv_safetyDayMild', { weather: weatherLabel }) });
+      } else if (isNight) {
+        setRouteSafetyAdvisory({ severity: 'moderate', message: t('drv_safetyNightClear') });
+      } else {
+        setRouteSafetyAdvisory(null);
+      }
+    } catch (e) {
+      console.error('Error loading route safety advisory:', e);
+      setRouteSafetyAdvisory(null);
+    }
+  }
+
+  useEffect(() => {
+    if (user?.id && !isTravelBusiness && hasFeature('trips') && activeTab === 'home') {
+      loadRouteSafetyAdvisory();
+    }
+  }, [user?.id, activeTab]);
+
+  // Opens the driver's own Maps app for turn-by-turn navigation with live traffic -
+  // no API key or billing needed, since Google Maps itself does the routing. Origin
+  // is left out of the URL so Maps defaults to the device's current location.
+  async function handleNavigate() {
+    const destination = navigateDestination.trim();
+    if (!destination) {
+      Alert.alert(t('common_missingField'), t('drv_navigateMissingDestination'));
+      return;
+    }
+    const url = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}&travelmode=driving`;
+    try {
+      await Linking.openURL(url);
+    } catch (e) {
+      console.error('Error opening navigation:', e);
+      Alert.alert(t('common_error'), t('drv_navigateUnavailable'));
+    }
+  }
+
   async function handleSaveQuickPayment() {
     const amount = parseFloat(quickPaymentAmount);
     if (!amount || amount <= 0) {
@@ -5371,7 +5835,12 @@ function CustomerAppContent() {
   // If user is logged in, show Customer Portal
   if (user) {
     return (
-      <View style={[styles.mainScreen, isDarkMode && styles.mainScreenDark]}>
+      <View
+        style={[styles.mainScreen, isDarkMode && styles.mainScreenDark]}
+        onStartShouldSetResponderCapture={() => {
+          registerActivity();
+          return false;
+        }}>
         {/* Top Header Bar with Safe Area spacing */}
         <LinearGradient
           colors={[colors.brandDark, colors.brand, colors.brandLight]}
@@ -5460,9 +5929,11 @@ function CustomerAppContent() {
                 <Text style={styles.homeBannerIcon}>{getBusinessIcon(user.businessType)}</Text>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.homeBannerTitle} numberOfLines={2}>
-                    {t('home_welcomeBanner', { business: (isBuildingBusiness && myBuilding?.name) ? myBuilding.name : user.businessType })}
+                    {t(getGreetingKey(), { name: user.fullName.split(' ')[0] })}
                   </Text>
-                  <Text style={styles.homeBannerSubtitle}>{t('header_active')} • {user.activePlan}</Text>
+                  <Text style={styles.homeBannerSubtitle}>
+                    {(isBuildingBusiness && myBuilding?.name) ? myBuilding.name : user.businessType} • {t('header_active')} • {user.activePlan}
+                  </Text>
                 </View>
               </View>
 
@@ -5498,6 +5969,25 @@ function CustomerAppContent() {
                   return { label: d.toLocaleDateString('en-US', { weekday: 'short' }), amount };
                 });
                 const recentPayments = driverTripsHistory.slice().sort((a, b) => b.tripTimeMs - a.tripTimeMs).slice(0, 5);
+
+                // Earnings-vs-usual: average of this same weekday over past weeks (excluding
+                // today), compared against today's earnings so far - gives the driver a sense
+                // of whether today's pace is ahead or behind their own normal rhythm.
+                const todayStart = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); })();
+                const todayDow = new Date().getDay();
+                const pastSameWeekdayTotals = new Map<string, number>();
+                driverTripsHistory.forEach(tr => {
+                  if (tr.tripTimeMs >= todayStart) return;
+                  const d = new Date(tr.tripTimeMs);
+                  if (d.getDay() !== todayDow) return;
+                  const key = d.toDateString();
+                  pastSameWeekdayTotals.set(key, (pastSameWeekdayTotals.get(key) || 0) + tr.fare);
+                });
+                const pastTotals = Array.from(pastSameWeekdayTotals.values());
+                const usualForToday = pastTotals.length ? Math.round(pastTotals.reduce((a, b) => a + b, 0) / pastTotals.length) : null;
+                const paceDiffPct = usualForToday && usualForToday > 0 ? Math.round(((totalTripEarnings - usualForToday) / usualForToday) * 100) : null;
+                const todayWeekdayLabel = new Date().toLocaleDateString(undefined, { weekday: 'long' });
+
                 const docChecks = [
                   { key: 'insurance', label: t('veh_insurance'), iso: vehicle.insuranceExpiry },
                   { key: 'fitness', label: t('veh_fitnessCert'), iso: vehicle.fitnessExpiry },
@@ -5507,6 +5997,39 @@ function CustomerAppContent() {
 
                 return (
                   <>
+                    {routeSafetyAdvisory && (
+                      <View style={{
+                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                        backgroundColor: routeSafetyAdvisory.severity === 'high' ? colors.redBg : colors.amberBg,
+                        borderWidth: 1, borderColor: routeSafetyAdvisory.severity === 'high' ? colors.redBorder : colors.amberBorder,
+                      }}>
+                        <Text style={{ fontSize: 20 }}>{routeSafetyAdvisory.severity === 'high' ? '⚠️' : '🌙'}</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_safetyTitle')}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{routeSafetyAdvisory.message}</Text>
+                        </View>
+                      </View>
+                    )}
+
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>{t('drv_navigateTitle')}</Text>
+                      <Text style={{ fontSize: 12, color: colors.muted, marginTop: 2, marginBottom: 10 }}>{t('drv_navigateHint')}</Text>
+                      <View style={{ flexDirection: 'row', gap: 10 }}>
+                        <TextInput
+                          placeholder={t('drv_navigateDestinationPh')}
+                          placeholderTextColor={colors.muted}
+                          style={[styles.modalInput, { flex: 1 }]}
+                          value={navigateDestination}
+                          onChangeText={setNavigateDestination}
+                          onSubmitEditing={handleNavigate}
+                          returnKeyType="go"
+                        />
+                        <Pressable onPress={handleNavigate} style={[styles.primaryPillBtn, { justifyContent: 'center' }]}>
+                          <Text style={styles.primaryPillBtnText}>🧭 {t('drv_navigateGo')}</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+
                     {urgentDocs.length > 0 && (
                       <Pressable
                         onPress={() => setActiveTab('vehicle')}
@@ -5532,7 +6055,33 @@ function CustomerAppContent() {
                       { icon: '🗺️', label: t('home_todaysTrips'), value: String(trips.length), color: colors.brand },
                       { icon: '📏', label: t('home_todaysDistance'), value: `${totalTripDistance} km`, color: colors.blue },
                       { icon: '💵', label: t('home_todaysIncome'), value: `₹${totalTripEarnings}`, color: colors.green },
+                      {
+                        icon: '📊',
+                        label: t('home_todaysProfit'),
+                        value: `₹${totalTripEarnings - totalFuelCost}`,
+                        color: (totalTripEarnings - totalFuelCost) >= 0 ? colors.green : colors.red,
+                      },
                     ])}
+
+                    {paceDiffPct !== null && usualForToday !== null && (
+                      <View style={{
+                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                        backgroundColor: paceDiffPct >= 0 ? colors.greenBg : colors.amberBg,
+                        borderWidth: 1, borderColor: paceDiffPct >= 0 ? colors.greenBorder : colors.amberBorder,
+                      }}>
+                        <Text style={{ fontSize: 20 }}>{paceDiffPct >= 0 ? '📈' : '📉'}</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>
+                            {paceDiffPct >= 0
+                              ? t('drv_paceAhead', { pct: String(Math.abs(paceDiffPct)), day: todayWeekdayLabel })
+                              : t('drv_paceBehind', { pct: String(Math.abs(paceDiffPct)), day: todayWeekdayLabel })}
+                          </Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>
+                            {t('drv_paceDetail', { today: `₹${totalTripEarnings}`, usual: `₹${usualForToday}` })}
+                          </Text>
+                        </View>
+                      </View>
+                    )}
 
                     <View style={styles.seatMapCard}>
                       <Text style={styles.sectionHeading}>{t('drv_paymentMix')}</Text>
@@ -6428,18 +6977,6 @@ function CustomerAppContent() {
                 )}
               </View>
 
-              {/* Auto-record UPI credits detected from bank SMS (Android) */}
-              {Platform.OS === 'android' && (
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border, borderRadius: 14, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 14 }}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_smsAuto')}</Text>
-                    <Text style={{ fontSize: 11, color: smsStatus ? colors.greenDark : colors.muted, marginTop: 2 }}>
-                      {smsStatus || t('drv_smsAutoHint')}
-                    </Text>
-                  </View>
-                  <Switch value={smsAutoRecord} onValueChange={handleToggleSmsAutoRecord} trackColor={{ true: colors.brand }} />
-                </View>
-              )}
 
               {/* Trips KPI Summary */}
               <View style={styles.kpiRow}>
@@ -6609,6 +7146,310 @@ function CustomerAppContent() {
               ))}
             </View>
           )}
+
+          {/* Business Feature Tab: Driver Reports (week/month/custom-range history + charts) */}
+          {activeTab === 'driver_reports' && !isTravelBusiness && hasFeature('trips') && (() => {
+            const reportCashTotal = reportTrips.filter(t => t.paymentMode === 'Cash').reduce((s, t) => s + t.fare, 0);
+            const reportUpiTotal = reportTrips.filter(t => t.paymentMode === 'UPI').reduce((s, t) => s + t.fare, 0);
+            const reportTotalEarnings = reportCashTotal + reportUpiTotal;
+            const reportTotalFuelCost = reportFuelLogs.reduce((s, f) => s + f.totalCost, 0);
+            const reportNetProfit = reportTotalEarnings - reportTotalFuelCost;
+
+            const rangeStartISO =
+              reportPeriod === 'week'
+                ? formatDateISO(new Date(Date.now() - 6 * 24 * 60 * 60 * 1000))
+                : reportPeriod === 'month'
+                ? formatDateISO(new Date(Date.now() - 29 * 24 * 60 * 60 * 1000))
+                : reportCustomStart;
+            const rangeEndISO = reportPeriod === 'custom' ? reportCustomEnd : formatDateISO(new Date());
+
+            const earningsBuckets = buildPeriodBuckets(
+              reportTrips.map(t => ({ timeMs: t.tripTimeMs, amount: t.fare })),
+              rangeStartISO, rangeEndISO
+            );
+            const fuelBuckets = buildPeriodBuckets(
+              reportFuelLogs.map(f => ({ timeMs: f.fuelTimeMs, amount: f.totalCost })),
+              rangeStartISO, rangeEndISO
+            );
+
+            const sortedPayments = reportTrips.slice().sort((a, b) => b.tripTimeMs - a.tripTimeMs);
+            const sortedFuelLogs = reportFuelLogs.slice().sort((a, b) => b.fuelTimeMs - a.fuelTimeMs);
+
+            // Best/worst day of week: average earnings per occurrence of that weekday
+            // within the period (not a raw sum, so a period with e.g. 5 Mondays vs
+            // 4 Tuesdays doesn't unfairly favor whichever weekday appears more often).
+            const perDateTotals = new Map<string, { total: number; dow: number }>();
+            reportTrips.forEach(tr => {
+              const d = new Date(tr.tripTimeMs);
+              const key = d.toDateString();
+              const existing = perDateTotals.get(key);
+              if (existing) existing.total += tr.fare;
+              else perDateTotals.set(key, { total: tr.fare, dow: d.getDay() });
+            });
+            const dowGroups = new Map<number, number[]>();
+            perDateTotals.forEach(({ total, dow }) => {
+              if (!dowGroups.has(dow)) dowGroups.set(dow, []);
+              dowGroups.get(dow)!.push(total);
+            });
+            const dowAverages = Array.from(dowGroups.entries()).map(([dow, totals]) => ({
+              dow,
+              avg: totals.reduce((a, b) => a + b, 0) / totals.length,
+            }));
+            const bestDay = dowAverages.length > 0 ? dowAverages.reduce((a, b) => (b.avg > a.avg ? b : a)) : null;
+            const worstDay = dowAverages.length > 0 ? dowAverages.reduce((a, b) => (b.avg < a.avg ? b : a)) : null;
+
+            // Peak hours: which part of the day earns the most, using the same
+            // morning/afternoon/evening/night buckets as the greeting/safety features.
+            const peakTotals = { morning: 0, afternoon: 0, evening: 0, night: 0 };
+            reportTrips.forEach(tr => {
+              peakTotals[timeOfDayBucket(new Date(tr.tripTimeMs).getHours())] += tr.fare;
+            });
+            const peakBuckets = [
+              { label: t('drv_timeMorning'), amount: peakTotals.morning },
+              { label: t('drv_timeAfternoon'), amount: peakTotals.afternoon },
+              { label: t('drv_timeEvening'), amount: peakTotals.evening },
+              { label: t('drv_timeNight'), amount: peakTotals.night },
+            ];
+
+            async function handleExportReportPdf() {
+              setReportExporting(true);
+              try {
+                const periodLabel =
+                  reportPeriod === 'week' ? t('drv_reportsWeek') : reportPeriod === 'month' ? t('drv_reportsMonth') : t('drv_reportsCustom');
+                const paymentRows = sortedPayments
+                  .map(
+                    p => `<tr>
+                      <td>${new Date(p.tripTimeMs).toLocaleString()}</td>
+                      <td>${escapeHtml(p.route || p.locationName || '-')}</td>
+                      <td style="text-align:right;">₹${p.fare.toLocaleString()}</td>
+                      <td>${p.paymentMode}</td>
+                    </tr>`
+                  )
+                  .join('');
+                const fuelRows = sortedFuelLogs
+                  .map(
+                    f => `<tr>
+                      <td>${new Date(f.fuelTimeMs).toLocaleString()}</td>
+                      <td>${escapeHtml(f.station || '-')}</td>
+                      <td style="text-align:right;">₹${f.totalCost.toLocaleString()}</td>
+                      <td>${f.fuelType}</td>
+                    </tr>`
+                  )
+                  .join('');
+                const html = `
+                  <html>
+                    <head><meta charset="utf-8"/></head>
+                    <body style="font-family: Helvetica, Arial, sans-serif; color: #1e293b; padding: 24px;">
+                      <h1 style="margin-bottom: 2px;">BizPilot - Earnings Report</h1>
+                      <div style="color: #64748b; margin-bottom: 20px;">
+                        ${escapeHtml(user?.fullName || '')} · ${escapeHtml(user?.businessType || '')}<br/>
+                        ${periodLabel}: ${rangeStartISO} to ${rangeEndISO}
+                      </div>
+                      <table style="width:100%; border-collapse: collapse; margin-bottom: 24px;" cellpadding="8">
+                        <tr><td style="border:1px solid #e2e8f0;">Total Trips</td><td style="border:1px solid #e2e8f0; text-align:right;">${reportTrips.length}</td></tr>
+                        <tr><td style="border:1px solid #e2e8f0;">Total Earnings</td><td style="border:1px solid #e2e8f0; text-align:right;">₹${reportTotalEarnings.toLocaleString()}</td></tr>
+                        <tr><td style="border:1px solid #e2e8f0;">Total Fuel Cost</td><td style="border:1px solid #e2e8f0; text-align:right;">₹${reportTotalFuelCost.toLocaleString()}</td></tr>
+                        <tr><td style="border:1px solid #e2e8f0; font-weight:bold;">Net Profit</td><td style="border:1px solid #e2e8f0; text-align:right; font-weight:bold;">₹${reportNetProfit.toLocaleString()}</td></tr>
+                      </table>
+                      <h2>Payment History</h2>
+                      <table style="width:100%; border-collapse: collapse; font-size: 12px;" cellpadding="6">
+                        <tr style="background:#f1f5f9;"><th style="border:1px solid #e2e8f0; text-align:left;">Date</th><th style="border:1px solid #e2e8f0; text-align:left;">Route</th><th style="border:1px solid #e2e8f0; text-align:right;">Amount</th><th style="border:1px solid #e2e8f0;">Mode</th></tr>
+                        ${paymentRows || '<tr><td colspan="4" style="border:1px solid #e2e8f0; text-align:center; color:#94a3b8;">No payments in this period</td></tr>'}
+                      </table>
+                      <h2 style="margin-top:24px;">Fuel Log</h2>
+                      <table style="width:100%; border-collapse: collapse; font-size: 12px;" cellpadding="6">
+                        <tr style="background:#f1f5f9;"><th style="border:1px solid #e2e8f0; text-align:left;">Date</th><th style="border:1px solid #e2e8f0; text-align:left;">Station</th><th style="border:1px solid #e2e8f0; text-align:right;">Cost</th><th style="border:1px solid #e2e8f0;">Type</th></tr>
+                        ${fuelRows || '<tr><td colspan="4" style="border:1px solid #e2e8f0; text-align:center; color:#94a3b8;">No fuel fill-ups in this period</td></tr>'}
+                      </table>
+                    </body>
+                  </html>
+                `;
+                const { uri } = await Print.printToFileAsync({ html });
+                if (await Sharing.isAvailableAsync()) {
+                  await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: t('drv_reportsExport') });
+                } else {
+                  Alert.alert(t('common_error'), t('drv_reportsShareUnavailable'));
+                }
+              } catch (e) {
+                console.error('Error exporting report PDF:', e);
+                Alert.alert(t('common_error'), t('drv_reportsExportFailed'));
+              } finally {
+                setReportExporting(false);
+              }
+            }
+
+            return (
+              <View>
+                <View style={styles.modePillRow}>
+                  {(['week', 'month', 'custom'] as const).map(p => (
+                    <Pressable
+                      key={p}
+                      onPress={() => setReportPeriod(p)}
+                      style={[styles.modePill, reportPeriod === p && styles.modePillActive]}>
+                      <Text style={[styles.modePillText, reportPeriod === p && styles.modePillTextActive]}>
+                        {p === 'week' ? t('drv_reportsWeek') : p === 'month' ? t('drv_reportsMonth') : t('drv_reportsCustom')}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+
+                <Pressable
+                  onPress={handleExportReportPdf}
+                  disabled={reportExporting || reportLoading || reportTrips.length === 0}
+                  style={[
+                    styles.primaryPillBtn,
+                    { alignSelf: 'flex-start', marginBottom: 14 },
+                    (reportExporting || reportLoading || reportTrips.length === 0) && { opacity: 0.5 },
+                  ]}>
+                  <Text style={styles.primaryPillBtnText}>
+                    {reportExporting ? t('common_saving') : `📄 ${t('drv_reportsExport')}`}
+                  </Text>
+                </Pressable>
+
+                {reportPeriod === 'custom' && (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+                    <Pressable onPress={openReportStartPicker} style={[styles.modalInput, { flex: 1, justifyContent: 'center' }]}>
+                      <Text style={{ fontSize: 13, color: colors.navy, fontWeight: '600' }}>{reportCustomStart}</Text>
+                    </Pressable>
+                    <Text style={{ color: colors.muted }}>–</Text>
+                    <Pressable onPress={openReportEndPicker} style={[styles.modalInput, { flex: 1, justifyContent: 'center' }]}>
+                      <Text style={{ fontSize: 13, color: colors.navy, fontWeight: '600' }}>{reportCustomEnd}</Text>
+                    </Pressable>
+                  </View>
+                )}
+
+                {reportPeriod === 'custom' && reportCustomStart > reportCustomEnd ? (
+                  <Text style={styles.emptyStateText}>{t('drv_reportsInvalidRange')}</Text>
+                ) : reportLoading ? (
+                  <Text style={styles.emptyStateText}>{t('common_loading')}</Text>
+                ) : (
+                  <>
+                    {renderHomeCardGrid([
+                      { icon: '🗺️', label: t('drv_reportsTotalTrips'), value: String(reportTrips.length), color: colors.brand },
+                      { icon: '💵', label: t('drv_reportsTotalEarnings'), value: `₹${reportTotalEarnings.toLocaleString()}`, color: colors.green },
+                      { icon: '⛽', label: t('fuel_totalSpent'), value: `₹${reportTotalFuelCost.toLocaleString()}`, color: colors.amber },
+                      {
+                        icon: '📊',
+                        label: t('drv_reportsNetProfit'),
+                        value: `₹${reportNetProfit.toLocaleString()}`,
+                        color: reportNetProfit >= 0 ? colors.green : colors.red,
+                      },
+                    ])}
+
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>{t('drv_paymentMix')}</Text>
+                      <View style={{ marginTop: 10 }}>{renderPaymentMixChart(reportCashTotal, reportUpiTotal)}</View>
+                    </View>
+
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>{t('drv_reportsEarningsTrend')}</Text>
+                      <View style={{ marginTop: 6 }}>
+                        {renderEarningsTrendChart(earningsBuckets, selectedReportEarningsDay, setSelectedReportEarningsDay)}
+                      </View>
+                    </View>
+
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>{t('drv_reportsFuelTrend')}</Text>
+                      <View style={{ marginTop: 6 }}>
+                        {renderEarningsTrendChart(fuelBuckets, selectedReportFuelDay, setSelectedReportFuelDay)}
+                      </View>
+                    </View>
+
+                    {bestDay && worstDay && dowAverages.length >= 2 && (
+                      <View style={{ flexDirection: 'row', gap: 10, marginBottom: 14 }}>
+                        <View style={[styles.seatMapCard, { flex: 1, marginBottom: 0, backgroundColor: colors.greenBg, borderWidth: 1, borderColor: colors.greenBorder }]}>
+                          <Text style={{ fontSize: 11, fontWeight: '700', color: colors.greenDark }}>{t('drv_reportsBestDay')}</Text>
+                          <Text style={{ fontSize: 15, fontWeight: '800', color: colors.navy, marginTop: 2 }}>{weekdayName(bestDay.dow)}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{t('drv_reportsAvgPerDay', { amount: `₹${Math.round(bestDay.avg).toLocaleString()}` })}</Text>
+                        </View>
+                        <View style={[styles.seatMapCard, { flex: 1, marginBottom: 0, backgroundColor: colors.amberBg, borderWidth: 1, borderColor: colors.amberBorder }]}>
+                          <Text style={{ fontSize: 11, fontWeight: '700', color: colors.amber }}>{t('drv_reportsWorstDay')}</Text>
+                          <Text style={{ fontSize: 15, fontWeight: '800', color: colors.navy, marginTop: 2 }}>{weekdayName(worstDay.dow)}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{t('drv_reportsAvgPerDay', { amount: `₹${Math.round(worstDay.avg).toLocaleString()}` })}</Text>
+                        </View>
+                      </View>
+                    )}
+
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>{t('drv_reportsPeakHours')}</Text>
+                      <View style={{ marginTop: 6 }}>
+                        {renderEarningsTrendChart(peakBuckets, selectedReportPeakBucket, setSelectedReportPeakBucket)}
+                      </View>
+                    </View>
+
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>{t('drv_paymentHistory')}</Text>
+                      {sortedPayments.length === 0 ? (
+                        <Text style={[styles.emptyStateText, { marginTop: 10 }]}>{t('drv_noPaymentsYet')}</Text>
+                      ) : (
+                        <View style={{ marginTop: 8 }}>
+                          {sortedPayments.map((entry, idx) => (
+                            <View
+                              key={idx}
+                              style={{
+                                flexDirection: 'row', alignItems: 'center', paddingVertical: 8,
+                                borderTopWidth: idx === 0 ? 0 : 1, borderTopColor: colors.border,
+                              }}>
+                              <View style={{ flex: 1, paddingRight: 8 }}>
+                                <Text style={{ fontSize: 13, fontWeight: '600', color: colors.navy }} numberOfLines={1}>
+                                  {entry.route || entry.locationName || t('drv_locationUnavailable')}
+                                </Text>
+                                <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }}>
+                                  {new Date(entry.tripTimeMs).toLocaleDateString([], { month: 'short', day: 'numeric' })} ·{' '}
+                                  {new Date(entry.tripTimeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </Text>
+                              </View>
+                              <Text style={{ fontSize: 14, fontWeight: '800', color: colors.green, marginRight: 8 }}>
+                                +₹{entry.fare.toLocaleString()}
+                              </Text>
+                              <View style={[styles.modeBadge, entry.paymentMode === 'UPI' ? styles.modeBadgeUpi : styles.modeBadgeCash]}>
+                                <Text style={[styles.modeBadgeText, entry.paymentMode === 'UPI' ? styles.modeBadgeTextUpi : styles.modeBadgeTextCash]}>
+                                  {entry.paymentMode}
+                                </Text>
+                              </View>
+                            </View>
+                          ))}
+                        </View>
+                      )}
+                    </View>
+
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>{t('fuel_fuelLogs', { count: sortedFuelLogs.length })}</Text>
+                      {sortedFuelLogs.length === 0 ? (
+                        <Text style={[styles.emptyStateText, { marginTop: 10 }]}>{t('drv_reportsNoFuelLogs')}</Text>
+                      ) : (
+                        <View style={{ marginTop: 8 }}>
+                          {sortedFuelLogs.map((log, idx) => (
+                            <View
+                              key={idx}
+                              style={{
+                                flexDirection: 'row', alignItems: 'center', paddingVertical: 8,
+                                borderTopWidth: idx === 0 ? 0 : 1, borderTopColor: colors.border,
+                              }}>
+                              <View style={{ flex: 1, paddingRight: 8 }}>
+                                <Text style={{ fontSize: 13, fontWeight: '600', color: colors.navy }} numberOfLines={1}>
+                                  {log.station || '—'}
+                                </Text>
+                                <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }}>
+                                  {new Date(log.fuelTimeMs).toLocaleDateString([], { month: 'short', day: 'numeric' })}
+                                </Text>
+                              </View>
+                              <Text style={{ fontSize: 14, fontWeight: '800', color: colors.red, marginRight: 8 }}>
+                                -₹{log.totalCost.toLocaleString()}
+                              </Text>
+                              <View style={styles.fuelTypePill}>
+                                <Text style={styles.fuelTypePillText}>{log.fuelType}</Text>
+                              </View>
+                            </View>
+                          ))}
+                        </View>
+                      )}
+                    </View>
+                  </>
+                )}
+              </View>
+            );
+          })()}
 
           {/* Business Feature Tab: Fuel (Travels Bus Booking Online) */}
           {activeTab === 'fuel' && isTravelBusiness && (
@@ -9133,6 +9974,42 @@ function CustomerAppContent() {
                 </View>
               </View>
 
+              {/* PIN Login management */}
+              <View style={styles.supportCard}>
+                <Text style={styles.supportHeading}>🔐 {t('pin_profileHeading')}</Text>
+                <Text style={styles.supportDesc}>
+                  {pinLoginAvailable ? t('pin_profileEnabledDesc') : t('pin_profileDisabledDesc')}
+                </Text>
+                <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
+                  <Pressable
+                    onPress={() => {
+                      setSetupPinStep('enter');
+                      setSetupPinValue('');
+                      setSetupPinConfirmValue('');
+                      setSetupPinError('');
+                      setShowSetupPinModal(true);
+                    }}
+                    style={[styles.primaryPillBtn, { flex: 1, alignItems: 'center' }]}>
+                    <Text style={styles.primaryPillBtnText}>{pinLoginAvailable ? t('pin_changeBtn') : t('pin_setupBtn')}</Text>
+                  </Pressable>
+                  {pinLoginAvailable && (
+                    <Pressable
+                      onPress={() =>
+                        Alert.alert(t('pin_disableConfirmTitle'), t('pin_disableConfirmMsg'), [
+                          { text: t('common_cancel'), style: 'cancel' },
+                          { text: t('pin_disableBtn'), style: 'destructive', onPress: handleDisablePinLogin },
+                        ])
+                      }
+                      style={{
+                        flex: 1, backgroundColor: colors.redBg, borderWidth: 1, borderColor: colors.redBorder,
+                        borderRadius: 8, paddingVertical: 9, alignItems: 'center', justifyContent: 'center',
+                      }}>
+                      <Text style={{ color: colors.red, fontSize: 12, fontWeight: '700' }}>{t('pin_disableBtn')}</Text>
+                    </Pressable>
+                  )}
+                </View>
+              </View>
+
               {/* Log Out button in Profile tab */}
               <Pressable
                 onPress={handleLogout}
@@ -10652,6 +11529,42 @@ function CustomerAppContent() {
           </Pressable>
         </Modal>
 
+        {/* Modal: Driver Reports - custom range "from" date */}
+        <Modal visible={showReportStartPicker} animationType="fade" transparent onRequestClose={() => setShowReportStartPicker(false)}>
+          <Pressable style={styles.modalOverlay} onPress={() => setShowReportStartPicker(false)}>
+            <Pressable style={styles.modalContent} onPress={e => e.stopPropagation()}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>📅 {t('drv_reportsFrom')}</Text>
+                <Pressable onPress={() => setShowReportStartPicker(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              {renderCalendarPicker(reportStartCalendarMonth, reportCustomStart, shiftReportStartCalendarMonth, (iso) => {
+                setReportCustomStart(iso);
+                setShowReportStartPicker(false);
+              })}
+            </Pressable>
+          </Pressable>
+        </Modal>
+
+        {/* Modal: Driver Reports - custom range "to" date */}
+        <Modal visible={showReportEndPicker} animationType="fade" transparent onRequestClose={() => setShowReportEndPicker(false)}>
+          <Pressable style={styles.modalOverlay} onPress={() => setShowReportEndPicker(false)}>
+            <Pressable style={styles.modalContent} onPress={e => e.stopPropagation()}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>📅 {t('drv_reportsTo')}</Text>
+                <Pressable onPress={() => setShowReportEndPicker(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              {renderCalendarPicker(reportEndCalendarMonth, reportCustomEnd, shiftReportEndCalendarMonth, (iso) => {
+                setReportCustomEnd(iso);
+                setShowReportEndPicker(false);
+              })}
+            </Pressable>
+          </Pressable>
+        </Modal>
+
         {/* Modal: Book Seat (Travels Bus Booking Online) */}
         <Modal visible={showBookSeatModal} animationType="slide" transparent onRequestClose={() => setShowBookSeatModal(false)}>
           <View style={styles.modalOverlay}>
@@ -11687,12 +12600,19 @@ function CustomerAppContent() {
                     </Text>
                   </View>
                 ))}
-                {chatLoading && (
+                {(chatLoading || chatVoiceProcessing) && (
                   <View style={[styles.chatBubble, styles.chatBubbleBot]}>
-                    <Text style={styles.chatBubbleBotText}>Thinking...</Text>
+                    <Text style={styles.chatBubbleBotText}>
+                      {chatVoiceProcessing ? t('drv_voiceProcessing') : 'Thinking...'}
+                    </Text>
                   </View>
                 )}
               </ScrollView>
+              {voiceRecorderState.isRecording && (
+                <Text style={{ fontSize: 11, color: colors.muted, textAlign: 'center', paddingBottom: 6 }}>
+                  {t('drv_voiceListeningHint')}
+                </Text>
+              )}
               <View style={styles.chatInputRow}>
                 <TextInput
                   placeholder="Ask about your collection, sales, stock..."
@@ -11701,16 +12621,77 @@ function CustomerAppContent() {
                   value={chatInput}
                   onChangeText={setChatInput}
                   onSubmitEditing={handleSendChatMessage}
-                  editable={!chatLoading}
+                  editable={!chatLoading && !chatVoiceProcessing}
                   returnKeyType="send"
                 />
                 <Pressable
+                  onPress={voiceRecorderState.isRecording ? handleStopChatVoiceRecording : handleStartChatVoiceRecording}
+                  disabled={chatLoading || chatVoiceProcessing}
+                  style={[
+                    styles.chatSendBtn,
+                    { backgroundColor: voiceRecorderState.isRecording ? colors.red : colors.brand, marginRight: 8 },
+                    (chatLoading || chatVoiceProcessing) && { opacity: 0.5 },
+                  ]}>
+                  <Text style={styles.chatSendBtnText}>{voiceRecorderState.isRecording ? '■' : '🎤'}</Text>
+                </Pressable>
+                <Pressable
                   onPress={handleSendChatMessage}
-                  disabled={chatLoading || !chatInput.trim()}
-                  style={[styles.chatSendBtn, (chatLoading || !chatInput.trim()) && { opacity: 0.5 }]}>
+                  disabled={chatLoading || chatVoiceProcessing || !chatInput.trim()}
+                  style={[styles.chatSendBtn, (chatLoading || chatVoiceProcessing || !chatInput.trim()) && { opacity: 0.5 }]}>
                   <Text style={styles.chatSendBtnText}>➤</Text>
                 </Pressable>
               </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Set up PIN login (offered once after a full email+DOB login) */}
+        <Modal visible={showSetupPinModal} animationType="fade" transparent onRequestClose={handleSkipSetupPin}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>🔐 {t('pin_setupTitle')}</Text>
+                <Pressable onPress={handleSkipSetupPin}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              <Text style={{ fontSize: 12, color: colors.muted, marginBottom: 14 }}>
+                {setupPinStep === 'enter' ? t('pin_setupHint') : t('pin_setupConfirmHint')}
+              </Text>
+              <TextInput
+                autoFocus
+                keyboardType="number-pad"
+                secureTextEntry
+                maxLength={6}
+                placeholder="••••"
+                placeholderTextColor={colors.muted}
+                style={[styles.modalInput, { textAlign: 'center', fontSize: 24, letterSpacing: 10 }]}
+                value={setupPinStep === 'enter' ? setupPinValue : setupPinConfirmValue}
+                onChangeText={(v) => {
+                  const digits = v.replace(/[^0-9]/g, '');
+                  if (setupPinStep === 'enter') setSetupPinValue(digits);
+                  else setSetupPinConfirmValue(digits);
+                  setSetupPinError('');
+                }}
+                onSubmitEditing={handleSaveSetupPin}
+              />
+              {!!setupPinError && (
+                <Text style={{ fontSize: 12, color: colors.red, marginTop: 8 }}>⚠️ {setupPinError}</Text>
+              )}
+              <Pressable
+                onPress={handleSaveSetupPin}
+                disabled={setupPinSaving || (setupPinStep === 'enter' ? setupPinValue.length < 4 : setupPinConfirmValue.length < 4)}
+                style={[
+                  styles.modalSubmitBtn, { marginTop: 16 },
+                  (setupPinSaving || (setupPinStep === 'enter' ? setupPinValue.length < 4 : setupPinConfirmValue.length < 4)) && { opacity: 0.5 },
+                ]}>
+                <Text style={styles.modalSubmitBtnText}>
+                  {setupPinSaving ? t('common_saving') : setupPinStep === 'enter' ? t('common_next') : t('pin_setupSave')}
+                </Text>
+              </Pressable>
+              <Pressable onPress={handleSkipSetupPin} style={{ marginTop: 12, alignItems: 'center' }}>
+                <Text style={{ fontSize: 12, fontWeight: '700', color: colors.muted }}>{t('pin_setupSkip')}</Text>
+              </Pressable>
             </View>
           </View>
         </Modal>
@@ -12927,7 +13908,50 @@ function CustomerAppContent() {
           </Text>
         </View>
 
-        {authMode === 'login' ? (
+        {showPinScreen ? (
+          /* PIN Unlock Card */
+          <View style={styles.authFormCard}>
+            <Text style={styles.formTitle}>
+              {pinLoginName ? t('pin_welcomeBack', { name: pinLoginName.split(' ')[0] }) : t('pin_welcomeBackGeneric')}
+            </Text>
+            <Text style={styles.formSubtitle}>{t('pin_enterHint')}</Text>
+
+            <TextInput
+              autoFocus
+              keyboardType="number-pad"
+              secureTextEntry
+              maxLength={6}
+              placeholder="••••"
+              placeholderTextColor={colors.muted}
+              style={[styles.authInput, { textAlign: 'center', fontSize: 28, letterSpacing: 12 }]}
+              value={pinInput}
+              onChangeText={(v) => {
+                setPinInput(v.replace(/[^0-9]/g, ''));
+                setPinError('');
+              }}
+              onSubmitEditing={handlePinSubmit}
+            />
+
+            {!!pinError && (
+              <View style={styles.errorBox}>
+                <Text style={styles.errorText}>⚠️ {pinError}</Text>
+              </View>
+            )}
+
+            <Pressable
+              onPress={handlePinSubmit}
+              disabled={pinUnlocking || pinInput.length < 4}
+              style={[styles.signInButton, (pinUnlocking || pinInput.length < 4) && { opacity: 0.6 }]}>
+              <Text style={styles.signInButtonText}>{pinUnlocking ? t('common_loading') : t('pin_unlock')}</Text>
+            </Pressable>
+
+            <Pressable onPress={handleUseFullLoginInstead} style={styles.switchAuthModeBtn}>
+              <Text style={styles.switchAuthModeText}>{t('pin_useEmailInstead')}</Text>
+            </Pressable>
+
+            <Text style={styles.authFooterBadge}>🔒 Secure 256-bit Encrypted Customer Ledger</Text>
+          </View>
+        ) : authMode === 'login' ? (
           /* Login Form Card */
           <View style={styles.authFormCard}>
             <Text style={styles.formTitle}>Sign In to Your Ledger</Text>
@@ -12972,33 +13996,6 @@ function CustomerAppContent() {
             <Pressable onPress={() => handleLogin()} disabled={loading} style={styles.signInButton}>
               <Text style={styles.signInButtonText}>{loading ? 'Signing In...' : 'Access My Account'}</Text>
             </Pressable>
-
-            <Pressable
-              onPress={() => {
-                setErrorMessage('');
-                setAdminNotice(null);
-                setAuthMode('register');
-              }}
-              style={styles.switchAuthModeBtn}>
-              <Text style={styles.switchAuthModeText}>New here? <Text style={styles.switchAuthModeTextBold}>Create an account</Text></Text>
-            </Pressable>
-
-            {/* Quick Demo Customer Buttons for instant testing */}
-            <View style={styles.demoSection}>
-              <Text style={styles.demoSectionTitle}>Tap for demo customer test accounts:</Text>
-              <View style={styles.demoPillsRow}>
-                <Pressable
-                  onPress={() => handleQuickFill('prem@gmail.com', '1992-09-01')}
-                  style={styles.demoAccountChip}>
-                  <Text style={styles.demoAccountChipText}>🛺 Prem N (Driver)</Text>
-                </Pressable>
-                <Pressable
-                  onPress={() => handleQuickFill('riya@gmail.com', '1992-09-01')}
-                  style={styles.demoAccountChip}>
-                  <Text style={styles.demoAccountChipText}>💰 Riya N (Collection Agent)</Text>
-                </Pressable>
-              </View>
-            </View>
 
             <Text style={styles.authFooterBadge}>🔒 Secure 256-bit Encrypted Customer Ledger</Text>
           </View>
@@ -13171,11 +14168,13 @@ function getBusinessIcon(type?: string) {
   return '💼';
 }
 
-function getGreetingKey(): 'header_goodMorning' | 'header_goodAfternoon' | 'header_goodEvening' {
+function getGreetingKey(): 'header_goodMorning' | 'header_goodAfternoon' | 'header_goodEvening' | 'header_goodNight' {
   const hour = new Date().getHours();
+  if (hour < 5) return 'header_goodNight';
   if (hour < 12) return 'header_goodMorning';
   if (hour < 17) return 'header_goodAfternoon';
-  return 'header_goodEvening';
+  if (hour < 21) return 'header_goodEvening';
+  return 'header_goodNight';
 }
 
 function renderHomeCardGrid(cards: { icon: string; label: string; value: string; color: string }[]) {
