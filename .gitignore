@@ -66,10 +66,8 @@ yarn-error.log
 # testing
 /coverage
 
-# Python backend
-backend/.venv/
-backend/__pycache__/
-backend/.env
+# Python backend - now its own standalone git repository
+backend/
 
 # Yarn
 .yarn/*
