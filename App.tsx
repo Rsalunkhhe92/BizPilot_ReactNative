@@ -5,6 +5,7 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   Animated,
   AppState,
@@ -42,6 +43,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import * as SecureStore from 'expo-secure-store';
+import * as Speech from 'expo-speech';
 import { detectUpiCredit } from './smsPayments';
 import { isSmsReaderAvailable, readInbox } from './modules/sms-reader';
 import { Language, LANGUAGE_LABELS, TranslationKey, translate } from './i18n';
@@ -186,6 +188,17 @@ function escapeHtml(value: string): string {
     .replace(/"/g, '&quot;');
 }
 
+const TTS_LOCALE_BY_LANGUAGE: Record<Language, string> = { en: 'en-IN', hi: 'hi-IN', mr: 'mr-IN' };
+
+function speakConfirmation(text: string, language: Language) {
+  try {
+    Speech.stop();
+    Speech.speak(text, { language: TTS_LOCALE_BY_LANGUAGE[language], pitch: 1.0, rate: 0.95 });
+  } catch (e) {
+    console.error('Error speaking confirmation:', e);
+  }
+}
+
 function classifyWeatherRisk(code: number): {
   severity: 'none' | 'mild' | 'severe';
   labelKey: 'drv_weatherThunderstorm' | 'drv_weatherHeavy' | 'drv_weatherMild' | null;
@@ -194,6 +207,20 @@ function classifyWeatherRisk(code: number): {
   if ([45, 48, 65, 67, 75, 82, 86].includes(code)) return { severity: 'severe', labelKey: 'drv_weatherHeavy' };
   if ([51, 53, 55, 56, 57, 61, 63, 66, 71, 73, 77, 80, 81, 85].includes(code)) return { severity: 'mild', labelKey: 'drv_weatherMild' };
   return { severity: 'none', labelKey: null };
+}
+
+// General current-condition description (always shown), distinct from classifyWeatherRisk
+// (which only flags whether conditions are risky enough to warn about).
+function describeWeatherCondition(code: number, isNight: boolean): {
+  icon: string;
+  labelKey: 'drv_weatherCondClear' | 'drv_weatherCondCloudy' | 'drv_weatherCondFog' | 'drv_weatherCondRain' | 'drv_weatherCondSnow' | 'drv_weatherCondThunderstorm';
+} {
+  if (code >= 95) return { icon: '⛈️', labelKey: 'drv_weatherCondThunderstorm' };
+  if ([71, 73, 75, 77, 85, 86].includes(code)) return { icon: '❄️', labelKey: 'drv_weatherCondSnow' };
+  if ([45, 48].includes(code)) return { icon: '🌫️', labelKey: 'drv_weatherCondFog' };
+  if ([51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82].includes(code)) return { icon: isNight ? '🌧️' : '🌦️', labelKey: 'drv_weatherCondRain' };
+  if ([1, 2, 3].includes(code)) return { icon: isNight ? '☁️' : '⛅', labelKey: 'drv_weatherCondCloudy' };
+  return { icon: isNight ? '🌙' : '☀️', labelKey: 'drv_weatherCondClear' };
 }
 
 type UserType = 'admin' | 'customer';
@@ -655,6 +682,7 @@ function CustomerAppContent() {
   const [pinLoginAvailable, setPinLoginAvailable] = useState(false);
   const [showPinScreen, setShowPinScreen] = useState(false);
   const [pinLoginName, setPinLoginName] = useState('');
+  const [pinLoginEmail, setPinLoginEmail] = useState('');
   const [pinInput, setPinInput] = useState('');
   const [pinError, setPinError] = useState('');
   const [pinUnlocking, setPinUnlocking] = useState(false);
@@ -666,14 +694,31 @@ function CustomerAppContent() {
   const [setupPinSaving, setSetupPinSaving] = useState(false);
 
   useEffect(() => {
+    // Shown on the login screen before anyone is signed in, so this is intentionally
+    // device-wide: any stored PIN is worth offering, regardless of which account it
+    // belongs to - the PIN itself determines who gets logged in once entered.
     SecureStore.getItemAsync(PIN_STORE_KEYS.pin).then(storedPin => {
       if (storedPin) {
         setPinLoginAvailable(true);
         setShowPinScreen(true);
         SecureStore.getItemAsync(PIN_STORE_KEYS.name).then(name => setPinLoginName(name || '')).catch(() => {});
+        SecureStore.getItemAsync(PIN_STORE_KEYS.email).then(email => setPinLoginEmail(email || '')).catch(() => {});
       }
     }).catch(() => {});
   }, []);
+
+  // Re-check ownership after every login: the device's stored PIN (if any) might
+  // belong to a different account that previously used this same device/emulator,
+  // so "PIN login enabled" for Profile/setup-prompt purposes must be scoped to the
+  // email that's actually logged in right now, not just "a PIN exists somewhere".
+  useEffect(() => {
+    if (!user) return;
+    SecureStore.getItemAsync(PIN_STORE_KEYS.email).then(storedEmail => {
+      const ownedByThisUser = !!storedEmail && storedEmail.toLowerCase() === user.email.toLowerCase();
+      setPinLoginAvailable(ownedByThisUser);
+      if (!ownedByThisUser) setPinLoginName('');
+    }).catch(() => {});
+  }, [user?.id]);
 
   useEffect(() => {
     if (!user || pinLoginAvailable || !lastLoginCredentialsRef.current) return;
@@ -705,6 +750,7 @@ function CustomerAppContent() {
         setPinError(t('pin_setupExpired'));
         setShowPinScreen(false);
         setPinLoginAvailable(false);
+        setPinLoginEmail('');
         return;
       }
       const ok = await handleLogin(storedEmail, storedDob);
@@ -754,6 +800,7 @@ function CustomerAppContent() {
       await SecureStore.setItemAsync(PIN_STORE_KEYS.name, creds.fullName);
       setPinLoginAvailable(true);
       setPinLoginName(creds.fullName);
+      setPinLoginEmail(creds.email);
       setShowSetupPinModal(false);
     } catch (e) {
       console.error('Error saving PIN:', e);
@@ -778,6 +825,7 @@ function CustomerAppContent() {
     await AsyncStorage.removeItem(PIN_SETUP_DECLINED_KEY).catch(() => {});
     setPinLoginAvailable(false);
     setPinLoginName('');
+    setPinLoginEmail('');
   }
 
   // Registration form state (mobile self-registration, writes to the same userdetails table
@@ -811,6 +859,8 @@ function CustomerAppContent() {
   const [driverFuelHistory, setDriverFuelHistory] = useState<{ totalCost: number; fuelTimeMs: number }[]>([]);
   const [selectedFuelDay, setSelectedFuelDay] = useState<number | null>(null);
   const [routeSafetyAdvisory, setRouteSafetyAdvisory] = useState<{ severity: 'moderate' | 'high'; message: string } | null>(null);
+  const [weatherStatus, setWeatherStatus] = useState<{ icon: string; label: string; tempC: number } | null>(null);
+  const [weatherUnavailableReason, setWeatherUnavailableReason] = useState<'permission' | 'error' | null>(null);
   const [navigateDestination, setNavigateDestination] = useState('');
 
   // Driver Reports tab (week / month / custom date-range history + charts)
@@ -832,7 +882,28 @@ function CustomerAppContent() {
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [inventoryTransactions, setInventoryTransactions] = useState<any[]>([]);
   const [inventorySummary, setInventorySummary] = useState<any>(null);
-  const [inventoryPeriod, setInventoryPeriod] = useState<'daily' | 'weekly' | 'monthly'>('daily');
+  const [dcSelectedDate, setDcSelectedDate] = useState(formatDateISO(new Date()));
+  const [showDcCalendarPicker, setShowDcCalendarPicker] = useState(false);
+  const [dcCalendarMonth, setDcCalendarMonth] = useState(new Date());
+  const [showPurchaseDetailModal, setShowPurchaseDetailModal] = useState(false);
+  const [vendors, setVendors] = useState<any[]>([]);
+  const [vendorsLoading, setVendorsLoading] = useState(false);
+  const [showVendorPicker, setShowVendorPicker] = useState(false);
+  const [showAddVendorModal, setShowAddVendorModal] = useState(false);
+  const [newVendorName, setNewVendorName] = useState('');
+  const [newVendorMobile, setNewVendorMobile] = useState('');
+  const [newVendorEmail, setNewVendorEmail] = useState('');
+  const [newVendorAddress, setNewVendorAddress] = useState('');
+  const [addVendorLoading, setAddVendorLoading] = useState(false);
+  const [showVendorLedgerModal, setShowVendorLedgerModal] = useState(false);
+  const [vendorLedgerName, setVendorLedgerName] = useState('');
+  const [vendorLedger, setVendorLedger] = useState<any>(null);
+  const [vendorLedgerLoading, setVendorLedgerLoading] = useState(false);
+  const [showPayVendorModal, setShowPayVendorModal] = useState(false);
+  const [payVendorAmount, setPayVendorAmount] = useState('');
+  const [payVendorMethod, setPayVendorMethod] = useState<'CASH' | 'UPI' | 'CREDIT'>('CASH');
+  const [payVendorNote, setPayVendorNote] = useState('');
+  const [payVendorLoading, setPayVendorLoading] = useState(false);
 
   const [showAddProductModal, setShowAddProductModal] = useState(false);
   const [newProductName, setNewProductName] = useState('');
@@ -853,6 +924,10 @@ function CustomerAppContent() {
   const [saleType, setSaleType] = useState<'SALE' | 'PURCHASE' | 'WASTAGE'>('SALE');
   const [salePaymentMethod, setSalePaymentMethod] = useState<'CASH' | 'UPI' | 'CREDIT'>('CASH');
   const [recordSaleLoading, setRecordSaleLoading] = useState(false);
+  const [salePaidNow, setSalePaidNow] = useState('');
+  const [inventoryVoiceProcessing, setInventoryVoiceProcessing] = useState(false);
+  const [inventoryVoiceTranscript, setInventoryVoiceTranscript] = useState('');
+  const [inventoryVoiceConfirmed, setInventoryVoiceConfirmed] = useState(false);
 
   const [showEditStockModal, setShowEditStockModal] = useState(false);
   const [editStockProduct, setEditStockProduct] = useState<InventoryItem | null>(null);
@@ -1172,10 +1247,10 @@ function CustomerAppContent() {
     }
   }
 
-  async function loadInventoryTransactions(period = inventoryPeriod) {
+  async function loadInventoryTransactions(dateISO = dcSelectedDate) {
     if (!user?.id) return;
     try {
-      const res = await apiFetch(`/api/inventory/transactions?owner_id=${user.id}&period=${period}`);
+      const res = await apiFetch(`/api/inventory/transactions?owner_id=${user.id}&period=daily&date=${dateISO}`);
       if (res.ok) {
         const data = await res.json();
         setInventoryTransactions(data.transactions || []);
@@ -2310,23 +2385,241 @@ function CustomerAppContent() {
     if (user && activeTab === 'inventory') {
       loadRestockSuggestions();
     }
+    if (user && (activeTab === 'vendors' || activeTab === 'daily_collection')) {
+      loadVendors();
+    }
   }, [user?.id, activeTab]);
 
   useEffect(() => {
     if (user && (activeTab === 'inventory' || activeTab === 'daily_collection' || activeTab === 'sales')) {
-      loadInventoryTransactions(inventoryPeriod);
+      loadInventoryTransactions(dcSelectedDate);
     }
-  }, [inventoryPeriod]);
+  }, [dcSelectedDate]);
+
+  function shiftDcCalendarMonth(delta: number) {
+    setDcCalendarMonth(prev => new Date(prev.getFullYear(), prev.getMonth() + delta, 1));
+  }
+
+  function handleOpenAddInventoryVendor() {
+    setNewVendorName('');
+    setNewVendorMobile('');
+    setNewVendorEmail('');
+    setNewVendorAddress('');
+    setShowAddVendorModal(true);
+  }
+
+  async function handleAddVendor() {
+    if (!newVendorName.trim()) {
+      Alert.alert(t('common_missingField'), t('dc_missingVendorName'));
+      return;
+    }
+    if (!user?.id) {
+      Alert.alert(t('common_error'), t('inv_accountError'));
+      return;
+    }
+    setAddVendorLoading(true);
+    try {
+      const res = await apiFetch('/api/inventory/vendors', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ownerId: user.id,
+          name: newVendorName.trim(),
+          mobileNumber: newVendorMobile.trim(),
+          email: newVendorEmail.trim(),
+          address: newVendorAddress.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setShowAddVendorModal(false);
+        await loadVendors();
+      } else {
+        Alert.alert(t('common_error'), data.error || t('dc_recordFailed'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setAddVendorLoading(false);
+    }
+  }
+
+  async function loadVendors() {
+    if (!user?.id) return;
+    setVendorsLoading(true);
+    try {
+      const res = await apiFetch(`/api/inventory/vendors?owner_id=${user.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setVendors(data.vendors || []);
+      }
+    } catch (e) {
+      console.error('Error loading vendors:', e);
+    } finally {
+      setVendorsLoading(false);
+    }
+  }
+
+  async function loadVendorLedger(vendorName: string) {
+    if (!user?.id || !vendorName) return;
+    setVendorLedgerLoading(true);
+    try {
+      const res = await apiFetch(`/api/inventory/vendor-ledger?owner_id=${user.id}&vendor=${encodeURIComponent(vendorName)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setVendorLedger(data);
+      }
+    } catch (e) {
+      console.error('Error loading vendor ledger:', e);
+    } finally {
+      setVendorLedgerLoading(false);
+    }
+  }
+
+  function handleOpenVendorLedger(vendorName: string) {
+    if (!vendorName) return;
+    setVendorLedgerName(vendorName);
+    setVendorLedger(null);
+    setShowVendorLedgerModal(true);
+    loadVendorLedger(vendorName);
+  }
+
+  function handleOpenPayVendor() {
+    const due = vendorLedger?.totals?.totalDue || 0;
+    setPayVendorAmount(due > 0 ? String(due) : '');
+    setPayVendorMethod('CASH');
+    setPayVendorNote('');
+    setShowPayVendorModal(true);
+  }
+
+  async function handleRecordVendorPayment() {
+    const amount = parseFloat(payVendorAmount) || 0;
+    if (amount <= 0) {
+      Alert.alert(t('common_missingField'), t('dc_missingPayAmount'));
+      return;
+    }
+    if (!user?.id || !vendorLedgerName) return;
+    setPayVendorLoading(true);
+    try {
+      const res = await apiFetch('/api/inventory/vendor-payments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ownerId: user.id,
+          vendorName: vendorLedgerName,
+          amount,
+          paymentMethod: payVendorMethod,
+          note: payVendorNote.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setShowPayVendorModal(false);
+        await loadVendorLedger(vendorLedgerName);
+        if (activeTab === 'vendors') loadVendors();
+        Alert.alert(t('dc_paymentRecorded'), t('dc_paymentRecordedMsg', { amount, vendor: vendorLedgerName }));
+      } else {
+        Alert.alert(t('common_error'), data.error || t('dc_recordFailed'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setPayVendorLoading(false);
+    }
+  }
 
   function handleOpenRecordSale(item?: InventoryItem, type: 'SALE' | 'PURCHASE' | 'WASTAGE' = 'SALE', presetQty?: string) {
     setSaleProductId(item ? item.id : (inventory[0]?.id || ''));
     setSaleQuantity(presetQty || '');
     setSaleAmount('');
+    setSalePaidNow('');
     setSaleNote('');
     setSaleType(type);
     setSalePaymentMethod('CASH');
     setShowProductPicker(false);
+    setShowVendorPicker(false);
+    setInventoryVoiceTranscript('');
+    setInventoryVoiceConfirmed(false);
     setShowRecordSaleModal(true);
+  }
+
+  // ---- Fruit Seller "AI Agent": one voice note, classified as either adding a new
+  // product or recording a sale/purchase/wastage. Never saves anything itself - it
+  // only prefills the existing Add Product / Record Sale forms for the owner to
+  // review and confirm, same safeguard used for every other voice feature. ----
+  async function handleStartInventoryVoiceRecording() {
+    if (!user?.id) return;
+    try {
+      const perm = await requestRecordingPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert(t('common_error'), t('drv_micPermissionDenied'));
+        return;
+      }
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      await voiceRecorder.prepareToRecordAsync();
+      voiceRecorder.record();
+      setTimeout(() => {
+        if (voiceRecorder.isRecording) handleStopInventoryVoiceRecording();
+      }, 8000);
+    } catch (e) {
+      console.error('Error starting inventory voice recording:', e);
+      Alert.alert(t('common_error'), t('drv_voiceUnavailable'));
+    }
+  }
+
+  async function handleStopInventoryVoiceRecording() {
+    if (!user?.id || !voiceRecorder.isRecording) return;
+    try {
+      await voiceRecorder.stop();
+      const uri = voiceRecorder.uri;
+      if (!uri) {
+        Alert.alert(t('common_error'), t('drv_voiceUnavailable'));
+        return;
+      }
+      setInventoryVoiceProcessing(true);
+      const audioBase64 = await FileSystem.readAsStringAsync(uri, { encoding: 'base64' });
+      const res = await apiFetch('/api/inventory/voice-agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerId: user.id, audioBase64, mimeType: 'audio/mp4' }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        Alert.alert(t('common_error'), data.error);
+        return;
+      }
+      if (data.intent === 'add_product' && data.product?.name) {
+        setNewProductName(data.product.name);
+        setNewProductCategory('');
+        setNewProductUnit(data.product.unit || 'kg');
+        setNewProductStockQty('');
+        setNewProductSellingPrice(data.product.sellingPrice != null ? String(data.product.sellingPrice) : '');
+        setNewProductCostPrice(data.product.costPrice != null ? String(data.product.costPrice) : '');
+        setNewProductLowStock('');
+        setInventoryVoiceTranscript(data.transcript || '');
+        setInventoryVoiceConfirmed(false);
+        setShowAddProductModal(true);
+      } else if (data.intent === 'record_transaction' && data.transaction?.productName) {
+        const matched = inventory.find(p => p.name.toLowerCase() === String(data.transaction.productName).toLowerCase());
+        setSaleProductId(matched ? matched.id : (inventory[0]?.id || ''));
+        setSaleQuantity(data.transaction.quantity != null ? String(data.transaction.quantity) : '');
+        setSaleAmount(data.transaction.amount != null ? String(data.transaction.amount) : '');
+        setSaleNote('');
+        setSaleType(data.transaction.type || 'SALE');
+        setSalePaymentMethod(data.transaction.paymentMethod || 'CASH');
+        setShowProductPicker(false);
+        setInventoryVoiceTranscript(data.transcript || '');
+        setInventoryVoiceConfirmed(false);
+        setShowRecordSaleModal(true);
+      } else {
+        Alert.alert(t('inv_voiceUnclearTitle'), t('inv_voiceUnclearMsg', { transcript: data.transcript || '' }));
+      }
+    } catch (e) {
+      console.error('Error processing inventory voice recording:', e);
+      Alert.alert(t('common_error'), t('drv_voiceUnavailable'));
+    } finally {
+      setInventoryVoiceProcessing(false);
+    }
   }
 
   async function handleAddProduct() {
@@ -2405,6 +2698,7 @@ function CustomerAppContent() {
       Alert.alert(t('common_error'), t('inv_accountError'));
       return;
     }
+    const paidNow = saleType === 'PURCHASE' && salePaidNow.trim() !== '' ? parseFloat(salePaidNow) || 0 : undefined;
     setRecordSaleLoading(true);
     try {
       const res = await apiFetch('/api/inventory/transactions', {
@@ -2418,6 +2712,7 @@ function CustomerAppContent() {
           type: saleType,
           paymentMethod: salePaymentMethod,
           note: saleNote.trim(),
+          ...(paidNow !== undefined ? { amountPaid: paidNow } : {}),
         }),
       });
       const data = await res.json();
@@ -2425,10 +2720,16 @@ function CustomerAppContent() {
         setShowRecordSaleModal(false);
         await Promise.all([loadInventoryProducts(), loadInventoryTransactions()]);
         loadRestockSuggestions();
+        if (saleType === 'PURCHASE') loadVendors();
         if (saleType === 'WASTAGE') {
           Alert.alert(t('dc_wastageRecorded'), `${quantity} ${data.transaction.unit} ${t('inv_product').toLowerCase()} "${data.transaction.productName}" ₹${data.transaction.amount}`);
         } else if (saleType === 'PURCHASE') {
-          Alert.alert(t('dc_purchaseRecorded'), `${quantity} ${data.transaction.unit} — "${data.transaction.productName}" ₹${data.transaction.amount}`);
+          const due = data.transaction.amountDue || 0;
+          Alert.alert(
+            t('dc_purchaseRecorded'),
+            `${quantity} ${data.transaction.unit} — "${data.transaction.productName}" ₹${data.transaction.amount}` +
+              (due > 0 ? `\n${t('dc_dueToVendor', { amount: due })}` : '')
+          );
         } else {
           Alert.alert(t('dc_saleRecorded'), `₹${data.transaction.amount} — "${data.transaction.productName}"`);
         }
@@ -2959,10 +3260,11 @@ function CustomerAppContent() {
     { key: 'online_booking', label: t('trv_navBooking'), icon: '🎫', show: isTravelBusiness },
     { key: 'trips', label: t('nav_trips'), icon: '🗺️', show: hasFeature('trips') && !isTravelBusiness },
     { key: 'fuel', label: t('nav_fuelLog'), icon: '⛽', show: hasFeature('fuel') || isTravelBusiness },
-    { key: 'driver_reports', label: t('nav_driverReports'), icon: '📊', show: hasFeature('trips') && !isTravelBusiness },
+    { key: 'driver_reports', label: t('nav_driverReports'), icon: '📊', show: hasFeature('trips') || isTravelBusiness },
     { key: 'inventory', label: t('nav_inventory'), icon: '📦', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'daily_collection', label: t('nav_dailyCollection'), icon: '💰', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'inventory_insights', label: t('nav_insights'), icon: '📊', show: hasFeature('inventory') || hasFeature('products') },
+    { key: 'vendors', label: t('nav_vendors'), icon: '🏪', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'sales', label: t('nav_salesPos'), icon: '🛒', show: hasFeature('sales') },
     { key: 'service_jobs', label: t('nav_jobCards'), icon: '🔧', show: hasFeature('service_jobs') },
     { key: 'building_setup', label: t('bld_navBuilding'), icon: '🏢', show: isBuildingBusiness },
@@ -4012,26 +4314,51 @@ function CustomerAppContent() {
           ? 'days=30'
           : `start_date=${reportCustomStart}&end_date=${reportCustomEnd}`;
 
-      const [tripsRes, fuelRes] = await Promise.all([
-        apiFetch(`/api/driver/trips?owner_id=${user.id}&${rangeQuery}`),
-        apiFetch(`/api/driver/fuel-logs?owner_id=${user.id}&${rangeQuery}`),
-      ]);
-      const tripsData = tripsRes.ok ? await tripsRes.json() : { trips: [] };
-      const fuelData = fuelRes.ok ? await fuelRes.json() : { fuelLogs: [] };
+      if (isTravelBusiness) {
+        const [bookingsRes, fuelRes] = await Promise.all([
+          apiFetch(`/api/travel/bookings?owner_id=${user.id}&${rangeQuery}`),
+          apiFetch(`/api/travel/fuel-logs?owner_id=${user.id}&${rangeQuery}`),
+        ]);
+        const bookingsData = bookingsRes.ok ? await bookingsRes.json() : { bookings: [] };
+        const fuelData = fuelRes.ok ? await fuelRes.json() : { fuelLogs: [] };
 
-      setReportTrips((tripsData.trips || []).map((tr: any) => ({
-        fare: tr.fare,
-        paymentMode: tr.paymentMode,
-        tripTimeMs: new Date(tr.tripTime).getTime(),
-        route: tr.route || '',
-        locationName: tr.locationName || '',
-      })));
-      setReportFuelLogs((fuelData.fuelLogs || []).map((f: any) => ({
-        totalCost: f.totalCost || 0,
-        fuelTimeMs: new Date(f.fuelTime).getTime(),
-        fuelType: f.fuelType,
-        station: f.station || '',
-      })));
+        setReportTrips((bookingsData.bookings || []).map((b: any) => ({
+          fare: b.fare,
+          // "Online" is still a digital payment, same as UPI, for the purposes of
+          // this cash-vs-digital mix chart (which only knows two categories).
+          paymentMode: b.paymentMode === 'Cash' ? 'Cash' : 'UPI',
+          tripTimeMs: new Date(b.bookedAt).getTime(),
+          route: b.route || '',
+          locationName: '',
+        })));
+        setReportFuelLogs((fuelData.fuelLogs || []).map((f: any) => ({
+          totalCost: f.totalCost || 0,
+          fuelTimeMs: new Date(`${f.fuelDate}T00:00:00`).getTime(),
+          fuelType: f.fuelType,
+          station: f.station || '',
+        })));
+      } else {
+        const [tripsRes, fuelRes] = await Promise.all([
+          apiFetch(`/api/driver/trips?owner_id=${user.id}&${rangeQuery}`),
+          apiFetch(`/api/driver/fuel-logs?owner_id=${user.id}&${rangeQuery}`),
+        ]);
+        const tripsData = tripsRes.ok ? await tripsRes.json() : { trips: [] };
+        const fuelData = fuelRes.ok ? await fuelRes.json() : { fuelLogs: [] };
+
+        setReportTrips((tripsData.trips || []).map((tr: any) => ({
+          fare: tr.fare,
+          paymentMode: tr.paymentMode,
+          tripTimeMs: new Date(tr.tripTime).getTime(),
+          route: tr.route || '',
+          locationName: tr.locationName || '',
+        })));
+        setReportFuelLogs((fuelData.fuelLogs || []).map((f: any) => ({
+          totalCost: f.totalCost || 0,
+          fuelTimeMs: new Date(f.fuelTime).getTime(),
+          fuelType: f.fuelType,
+          station: f.station || '',
+        })));
+      }
     } catch (e) {
       console.error('Error loading report data:', e);
     } finally {
@@ -4040,7 +4367,7 @@ function CustomerAppContent() {
   }
 
   useEffect(() => {
-    if (user?.id && !isTravelBusiness && hasFeature('trips') && activeTab === 'driver_reports') {
+    if (user?.id && (hasFeature('trips') || isTravelBusiness) && activeTab === 'driver_reports') {
       if (reportPeriod !== 'custom' || (reportCustomStart && reportCustomEnd && reportCustomStart <= reportCustomEnd)) {
         loadDriverReportData();
       }
@@ -4258,6 +4585,10 @@ function CustomerAppContent() {
 
   // ---- Travels Bus Booking Online: Trips + Seat Map ----
   const [travelTrips, setTravelTrips] = useState<any[]>([]);
+  const [fareSuggestions, setFareSuggestions] = useState<{
+    tripId: string; route: string; travelDate: string; daysLeft: number;
+    currentFillPct: number; historicalFillPct: number; signal: 'high_demand' | 'low_demand'; currentFare: number;
+  }[]>([]);
   const [travelSelectedTrip, setTravelSelectedTrip] = useState<any>(null);
   const [travelSeats, setTravelSeats] = useState<any[]>([]);
   const [travelSeatsLoading, setTravelSeatsLoading] = useState(false);
@@ -4272,7 +4603,8 @@ function CustomerAppContent() {
   const [routeStopSuggestions, setRouteStopSuggestions] = useState<string[]>([]);
   const [newStopInput, setNewStopInput] = useState('');
   const [addingStop, setAddingStop] = useState(false);
-  const [tripBusTypeInput, setTripBusTypeInput] = useState<'seater' | 'sleeper'>('seater');
+  const [tripBusTypeInput, setTripBusTypeInput] = useState<'seater' | 'sleeper' | 'ertiga'>('seater');
+  const [showTripBusTypeDropdown, setShowTripBusTypeDropdown] = useState(false);
   const [showTripBusDropdown, setShowTripBusDropdown] = useState(false);
   const [tripSeaterCountInput, setTripSeaterCountInput] = useState('40');
   const [tripSleeperCountInput, setTripSleeperCountInput] = useState('0');
@@ -4287,6 +4619,10 @@ function CustomerAppContent() {
   const [showBookSeatModal, setShowBookSeatModal] = useState(false);
   const [showSeatDetailModal, setShowSeatDetailModal] = useState(false);
   const [activeSeat, setActiveSeat] = useState<any>(null);
+  const [draftingReminder, setDraftingReminder] = useState(false);
+  const [showReminderModal, setShowReminderModal] = useState(false);
+  const [reminderDraftText, setReminderDraftText] = useState('');
+  const [reminderMobile, setReminderMobile] = useState('');
   const [selectedSeatNumbers, setSelectedSeatNumbers] = useState<number[]>([]);
   const [bookPassengerName, setBookPassengerName] = useState('');
   const [bookMobile, setBookMobile] = useState('');
@@ -4308,7 +4644,14 @@ function CustomerAppContent() {
   const [editingVehicleId, setEditingVehicleId] = useState<string | null>(null);
   const [vehRegInput, setVehRegInput] = useState('');
   const [vehModelInput, setVehModelInput] = useState('');
-  const [vehBusTypeInput, setVehBusTypeInput] = useState<'seater' | 'sleeper'>('seater');
+  const [vehBusTypeInput, setVehBusTypeInput] = useState<'seater' | 'sleeper' | 'ertiga'>('seater');
+  const [showVehBusTypeDropdown, setShowVehBusTypeDropdown] = useState(false);
+
+  function vehicleTypeIconLabel(opt: 'seater' | 'sleeper' | 'ertiga') {
+    if (opt === 'sleeper') return `🛏️ ${t('trv_sleeper')}`;
+    if (opt === 'ertiga') return `🚙 ${t('trv_ertiga')}`;
+    return `💺 ${t('trv_seater')}`;
+  }
   const [vehFuelTypeInput, setVehFuelTypeInput] = useState<'Diesel' | 'Petrol' | 'CNG' | 'Electric'>('Diesel');
   const [vehRegDateInput, setVehRegDateInput] = useState('');
   const [vehTotalKmInput, setVehTotalKmInput] = useState('');
@@ -4352,7 +4695,7 @@ function CustomerAppContent() {
     setEditingVehicleId(v.id);
     setVehRegInput(v.regNumber);
     setVehModelInput(v.model);
-    setVehBusTypeInput(v.busType === 'sleeper' ? 'sleeper' : 'seater');
+    setVehBusTypeInput(v.busType === 'sleeper' ? 'sleeper' : v.busType === 'ertiga' ? 'ertiga' : 'seater');
     setVehFuelTypeInput(v.fuelType);
     setVehRegDateInput(v.regDate);
     setVehTotalKmInput(String(v.totalKm || ''));
@@ -4526,7 +4869,22 @@ function CustomerAppContent() {
       loadTravelTrips();
       loadTravelFuelLogs(fuelTripFilter);
     }
+    if (user?.id && isTravelBusiness && activeTab === 'online_booking') {
+      loadFareSuggestions();
+    }
   }, [user?.id, activeTab, fuelTripFilter, isTravelBusiness]);
+
+  async function loadFareSuggestions() {
+    if (!user?.id) return;
+    try {
+      const res = await apiFetch(`/api/travel/fare-suggestions?owner_id=${user.id}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setFareSuggestions(data.suggestions || []);
+    } catch (e) {
+      console.error('Error loading fare suggestions:', e);
+    }
+  }
 
   function handleDeleteTravelFuel(fuelId: string | number) {
     if (!user?.id) return;
@@ -4710,18 +5068,18 @@ function CustomerAppContent() {
 
   function handleSelectTripBus(v: any) {
     setTripBusNumberInput(v.regNumber);
-    handleSelectBusType(v.busType === 'sleeper' ? 'sleeper' : 'seater');
+    handleSelectBusType(v.busType === 'sleeper' ? 'sleeper' : v.busType === 'ertiga' ? 'ertiga' : 'seater');
     setShowTripBusDropdown(false);
   }
 
-  function handleSelectBusType(type: 'seater' | 'sleeper') {
+  function handleSelectBusType(type: 'seater' | 'sleeper' | 'ertiga') {
     setTripBusTypeInput(type);
-    if (type === 'seater') {
-      setTripSeaterCountInput(prev => (prev === '0' || !prev ? '40' : prev));
-      setTripSleeperCountInput('0');
-    } else {
+    if (type === 'sleeper') {
       setTripSeaterCountInput('0');
       setTripSleeperCountInput(prev => (prev === '0' || !prev ? '30' : prev));
+    } else {
+      setTripSleeperCountInput('0');
+      setTripSeaterCountInput(prev => (prev === '0' || !prev ? (type === 'ertiga' ? '7' : '40') : prev));
     }
   }
 
@@ -5274,6 +5632,34 @@ function CustomerAppContent() {
     }
   }
 
+  async function handleDraftReminder(tripId: string | number, seatNumber: number, mobileNumber: string) {
+    if (!user?.id) return;
+    if (!mobileNumber) {
+      Alert.alert(t('common_error'), t('trv_reminderNoMobile'));
+      return;
+    }
+    setDraftingReminder(true);
+    try {
+      const res = await apiFetch('/api/travel/draft-reminder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerId: user.id, tripId, seatNumber }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        Alert.alert(t('common_error'), data.error);
+        return;
+      }
+      setReminderDraftText(data.message || '');
+      setReminderMobile(data.mobileNumber || mobileNumber);
+      setShowReminderModal(true);
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setDraftingReminder(false);
+    }
+  }
+
   function buildMaintenancePaymentWhatsAppMessage(params: {
     ownerName: string;
     flatNumber: string;
@@ -5511,6 +5897,16 @@ function CustomerAppContent() {
     }
   }
 
+  // Caps the GPS+reverse-geocode lookup above to a short window so a quick
+  // payment save never sits waiting on a slow/cold GPS fix - the location is a
+  // nice-to-have for the trip list, not something worth delaying Save for.
+  function getCurrentLocationNameFast(timeoutMs = 1500): Promise<{ locationName: string; latitude: number; longitude: number } | null> {
+    return Promise.race([
+      getCurrentLocationName(),
+      new Promise<null>(resolve => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
+  }
+
   // ---- AI Route Safety advisory (Home tab, passive) ----
   // Combines time-of-day (night driving) with current local weather (free, no API
   // key needed via Open-Meteo) into a simple drive-carefully banner. Never blocks
@@ -5520,22 +5916,36 @@ function CustomerAppContent() {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
         setRouteSafetyAdvisory(null);
+        setWeatherStatus(null);
+        setWeatherUnavailableReason('permission');
         return;
       }
       const position = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Low });
       const { latitude, longitude } = position.coords;
       const res = await fetch(
-        `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=is_day,weather_code`
+        `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=is_day,weather_code,temperature_2m`
       );
       if (!res.ok) {
         setRouteSafetyAdvisory(null);
+        setWeatherStatus(null);
+        setWeatherUnavailableReason('error');
         return;
       }
       const data = await res.json();
       const isNight = data?.current?.is_day === 0;
       const weatherCode = data?.current?.weather_code ?? 0;
+      const tempC = data?.current?.temperature_2m;
       const weather = classifyWeatherRisk(weatherCode);
       const weatherLabel: string = weather.labelKey ? t(weather.labelKey) : '';
+
+      if (typeof tempC === 'number') {
+        const condition = describeWeatherCondition(weatherCode, isNight);
+        setWeatherStatus({ icon: condition.icon, label: t(condition.labelKey), tempC: Math.round(tempC) });
+        setWeatherUnavailableReason(null);
+      } else {
+        setWeatherStatus(null);
+        setWeatherUnavailableReason('error');
+      }
 
       if (weather.severity === 'severe') {
         setRouteSafetyAdvisory({
@@ -5554,11 +5964,13 @@ function CustomerAppContent() {
     } catch (e) {
       console.error('Error loading route safety advisory:', e);
       setRouteSafetyAdvisory(null);
+      setWeatherStatus(null);
+      setWeatherUnavailableReason('error');
     }
   }
 
   useEffect(() => {
-    if (user?.id && !isTravelBusiness && hasFeature('trips') && activeTab === 'home') {
+    if (user?.id && (isTravelBusiness || hasFeature('trips')) && activeTab === 'home') {
       loadRouteSafetyAdvisory();
     }
   }, [user?.id, activeTab]);
@@ -5590,7 +6002,7 @@ function CustomerAppContent() {
     if (!user?.id) return;
     setQuickPaymentSaving(true);
     try {
-      const location = await getCurrentLocationName();
+      const location = await getCurrentLocationNameFast();
       const res = await apiFetch('/api/driver/trips', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -5608,6 +6020,7 @@ function CustomerAppContent() {
         setShowQuickPaymentModal(false);
         loadDriverTrips();
         loadDriverTripsHistory();
+        speakConfirmation(t('drv_voiceReceivedMsg', { amount }), language);
       } else {
         Alert.alert(t('common_error'), data.error || t('common_networkError'));
       }
@@ -5925,17 +6338,19 @@ function CustomerAppContent() {
           )}
           {activeTab === 'home' && (
             <View>
-              <View style={styles.homeBannerCard}>
-                <Text style={styles.homeBannerIcon}>{getBusinessIcon(user.businessType)}</Text>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.homeBannerTitle} numberOfLines={2}>
-                    {t(getGreetingKey(), { name: user.fullName.split(' ')[0] })}
-                  </Text>
-                  <Text style={styles.homeBannerSubtitle}>
-                    {(isBuildingBusiness && myBuilding?.name) ? myBuilding.name : user.businessType} • {t('header_active')} • {user.activePlan}
-                  </Text>
+              {!isTravelBusiness && (
+                <View style={styles.homeBannerCard}>
+                  <Text style={styles.homeBannerIcon}>{getBusinessIcon(user.businessType)}</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.homeBannerTitle} numberOfLines={2}>
+                      {t(getGreetingKey(), { name: user.fullName.split(' ')[0] })}
+                    </Text>
+                    <Text style={styles.homeBannerSubtitle}>
+                      {(isBuildingBusiness && myBuilding?.name) ? myBuilding.name : user.businessType} • {t('header_active')} • {user.activePlan}
+                    </Text>
+                  </View>
                 </View>
-              </View>
+              )}
 
               {isTravelBusiness && (() => {
                 const todayISO = formatDateISO(new Date());
@@ -5944,14 +6359,89 @@ function CustomerAppContent() {
                 const totalRevenue = travelTrips.reduce((sum: number, tr: any) => sum + (tr.revenue || 0), 0);
                 const totalFuelCost = travelFuelLogs.reduce((sum: number, log: any) => sum + (log.totalCost || 0), 0);
                 const pendingBookings = travelTrips.filter((tr: any) => (tr.pendingAmount || 0) > 0).length;
-                return renderHomeCardGrid([
-                  { icon: '🚌', label: t('home_totalBuses'), value: String(travelVehicles.length), color: colors.brand },
-                  { icon: '🗓️', label: t('home_todaysTrips'), value: String(todaysTrips.length), color: colors.blue },
-                  { icon: '🎫', label: t('home_todaysBookings'), value: String(todaysBookings), color: colors.green },
-                  { icon: '💰', label: t('home_bookingRevenue'), value: `₹${totalRevenue.toLocaleString()}`, color: colors.brand },
-                  { icon: '⛽', label: t('home_fuelExpenses'), value: `₹${totalFuelCost.toLocaleString()}`, color: colors.amber },
-                  { icon: '⏳', label: t('home_pendingBookings'), value: String(pendingBookings), color: colors.red },
-                ]);
+                return (
+                  <>
+                    {weatherStatus ? (
+                      <View style={{
+                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                        backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
+                      }}>
+                        <Text style={{ fontSize: 24 }}>{weatherStatus.icon}</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{weatherStatus.label} · {weatherStatus.tempC}°C</Text>
+                        </View>
+                      </View>
+                    ) : weatherUnavailableReason === 'permission' ? (
+                      <Pressable
+                        onPress={() => Linking.openSettings()}
+                        style={{
+                          flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                          backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
+                        }}>
+                        <Text style={{ fontSize: 24 }}>📍</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{t('drv_weatherPermissionNeeded')}</Text>
+                        </View>
+                        <Text style={{ fontSize: 18, color: colors.muted }}>›</Text>
+                      </Pressable>
+                    ) : weatherUnavailableReason === 'error' ? (
+                      <View style={{
+                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                        backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
+                      }}>
+                        <Text style={{ fontSize: 24 }}>⚠️</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{t('drv_weatherUnavailable')}</Text>
+                        </View>
+                      </View>
+                    ) : null}
+
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>{t('drv_navigateTitle')}</Text>
+                      <Text style={{ fontSize: 12, color: colors.muted, marginTop: 2, marginBottom: 10 }}>{t('drv_navigateHint')}</Text>
+                      <View style={{ flexDirection: 'row', gap: 10 }}>
+                        <TextInput
+                          placeholder={t('drv_navigateDestinationPh')}
+                          placeholderTextColor={colors.muted}
+                          style={[styles.modalInput, { flex: 1 }]}
+                          value={navigateDestination}
+                          onChangeText={setNavigateDestination}
+                          onSubmitEditing={handleNavigate}
+                          returnKeyType="go"
+                        />
+                        <Pressable onPress={handleNavigate} style={[styles.primaryPillBtn, { justifyContent: 'center' }]}>
+                          <Text style={styles.primaryPillBtnText}>🧭 {t('drv_navigateGo')}</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+
+                    {routeSafetyAdvisory && (
+                      <View style={{
+                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                        backgroundColor: routeSafetyAdvisory.severity === 'high' ? colors.redBg : colors.amberBg,
+                        borderWidth: 1, borderColor: routeSafetyAdvisory.severity === 'high' ? colors.redBorder : colors.amberBorder,
+                      }}>
+                        <Text style={{ fontSize: 20 }}>{routeSafetyAdvisory.severity === 'high' ? '⚠️' : '🌙'}</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_safetyTitle')}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{routeSafetyAdvisory.message}</Text>
+                        </View>
+                      </View>
+                    )}
+
+                    {renderHomeCardGrid([
+                      { icon: '🚌', label: t('home_totalBuses'), value: String(travelVehicles.length), color: colors.brand },
+                      { icon: '🗓️', label: t('home_todaysTrips'), value: String(todaysTrips.length), color: colors.blue },
+                      { icon: '🎫', label: t('home_todaysBookings'), value: String(todaysBookings), color: colors.green },
+                      { icon: '💰', label: t('home_bookingRevenue'), value: `₹${totalRevenue.toLocaleString()}`, color: colors.brand },
+                      { icon: '⛽', label: t('home_fuelExpenses'), value: `₹${totalFuelCost.toLocaleString()}`, color: colors.amber },
+                      { icon: '⏳', label: t('home_pendingBookings'), value: String(pendingBookings), color: colors.red },
+                    ])}
+                  </>
+                );
               })()}
 
               {!isTravelBusiness && hasFeature('trips') && (() => {
@@ -6010,6 +6500,44 @@ function CustomerAppContent() {
                         </View>
                       </View>
                     )}
+
+                    {weatherStatus ? (
+                      <View style={{
+                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                        backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
+                      }}>
+                        <Text style={{ fontSize: 24 }}>{weatherStatus.icon}</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{weatherStatus.label} · {weatherStatus.tempC}°C</Text>
+                        </View>
+                      </View>
+                    ) : weatherUnavailableReason === 'permission' ? (
+                      <Pressable
+                        onPress={() => Linking.openSettings()}
+                        style={{
+                          flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                          backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
+                        }}>
+                        <Text style={{ fontSize: 24 }}>📍</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{t('drv_weatherPermissionNeeded')}</Text>
+                        </View>
+                        <Text style={{ fontSize: 18, color: colors.muted }}>›</Text>
+                      </Pressable>
+                    ) : weatherUnavailableReason === 'error' ? (
+                      <View style={{
+                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
+                        backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
+                      }}>
+                        <Text style={{ fontSize: 24 }}>⚠️</Text>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
+                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{t('drv_weatherUnavailable')}</Text>
+                        </View>
+                      </View>
+                    ) : null}
 
                     <View style={styles.seatMapCard}>
                       <Text style={styles.sectionHeading}>{t('drv_navigateTitle')}</Text>
@@ -6313,7 +6841,7 @@ function CustomerAppContent() {
                             <View style={styles.tripMetricsRow}>
                               <Text style={styles.tripMetricText}>{v.model || t('trv_noModel')}</Text>
                               <Text style={styles.bulletDot}>•</Text>
-                              <Text style={styles.tripTimeText}>{v.busType === 'sleeper' ? `🛏️ ${t('trv_sleeper')}` : `💺 ${t('trv_seater')}`}</Text>
+                              <Text style={styles.tripTimeText}>{vehicleTypeIconLabel(v.busType === 'sleeper' ? 'sleeper' : v.busType === 'ertiga' ? 'ertiga' : 'seater')}</Text>
                               <Text style={styles.bulletDot}>•</Text>
                               <Text style={styles.tripTimeText}>⛽ {v.fuelType}</Text>
                             </View>
@@ -6356,7 +6884,7 @@ function CustomerAppContent() {
                           <View style={styles.pillRow}>
                             <View style={styles.featureMiniPill}>
                               <Text style={styles.featureMiniPillText}>
-                                {selectedTravelVehicle.busType === 'sleeper' ? `🛏️ ${t('trv_sleeper')}` : `💺 ${t('trv_seater')}`}
+                                {vehicleTypeIconLabel(selectedTravelVehicle.busType === 'sleeper' ? 'sleeper' : selectedTravelVehicle.busType === 'ertiga' ? 'ertiga' : 'seater')}
                               </Text>
                             </View>
                             <View style={styles.featureMiniPill}>
@@ -6544,6 +7072,33 @@ function CustomerAppContent() {
             <View>
               {!travelSelectedTrip ? (
                 <>
+                  {fareSuggestions.length > 0 && (
+                    <View style={styles.seatMapCard}>
+                      <Text style={styles.sectionHeading}>💡 {t('trv_fareSuggestionsTitle')}</Text>
+                      {fareSuggestions.map(s => (
+                        <View
+                          key={s.tripId}
+                          style={{
+                            flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 12, padding: 10, marginTop: 10,
+                            backgroundColor: s.signal === 'high_demand' ? colors.greenBg : colors.amberBg,
+                            borderWidth: 1, borderColor: s.signal === 'high_demand' ? colors.greenBorder : colors.amberBorder,
+                          }}>
+                          <Text style={{ fontSize: 20 }}>{s.signal === 'high_demand' ? '📈' : '📉'}</Text>
+                          <View style={{ flex: 1 }}>
+                            <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>
+                              {s.route} • {s.travelDate}
+                            </Text>
+                            <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>
+                              {s.signal === 'high_demand'
+                                ? t('trv_fareSuggestHigh', { current: String(s.currentFillPct), usual: String(s.historicalFillPct), days: String(s.daysLeft) })
+                                : t('trv_fareSuggestLow', { current: String(s.currentFillPct), usual: String(s.historicalFillPct), days: String(s.daysLeft) })}
+                            </Text>
+                          </View>
+                        </View>
+                      ))}
+                    </View>
+                  )}
+
                   <View style={styles.sectionHeaderRow}>
                     <Text style={styles.sectionHeading}>{t('trv_tripsHeading')}</Text>
                     <View style={{ flexDirection: 'row', alignItems: 'center' }}>
@@ -7148,7 +7703,7 @@ function CustomerAppContent() {
           )}
 
           {/* Business Feature Tab: Driver Reports (week/month/custom-range history + charts) */}
-          {activeTab === 'driver_reports' && !isTravelBusiness && hasFeature('trips') && (() => {
+          {activeTab === 'driver_reports' && (hasFeature('trips') || isTravelBusiness) && (() => {
             const reportCashTotal = reportTrips.filter(t => t.paymentMode === 'Cash').reduce((s, t) => s + t.fare, 0);
             const reportUpiTotal = reportTrips.filter(t => t.paymentMode === 'UPI').reduce((s, t) => s + t.fare, 0);
             const reportTotalEarnings = reportCashTotal + reportUpiTotal;
@@ -7325,7 +7880,7 @@ function CustomerAppContent() {
                 ) : (
                   <>
                     {renderHomeCardGrid([
-                      { icon: '🗺️', label: t('drv_reportsTotalTrips'), value: String(reportTrips.length), color: colors.brand },
+                      { icon: '🗺️', label: isTravelBusiness ? t('drv_reportsTotalBookings') : t('drv_reportsTotalTrips'), value: String(reportTrips.length), color: colors.brand },
                       { icon: '💵', label: t('drv_reportsTotalEarnings'), value: `₹${reportTotalEarnings.toLocaleString()}`, color: colors.green },
                       { icon: '⛽', label: t('fuel_totalSpent'), value: `₹${reportTotalFuelCost.toLocaleString()}`, color: colors.amber },
                       {
@@ -7579,11 +8134,39 @@ function CustomerAppContent() {
               <View style={styles.sectionHeaderRow}>
                 <Text style={styles.sectionHeading}>{t('inv_catalogHeading')}</Text>
                 <Pressable
-                  onPress={() => setShowAddProductModal(true)}
+                  onPress={() => {
+                    setInventoryVoiceTranscript('');
+                    setInventoryVoiceConfirmed(false);
+                    setShowAddProductModal(true);
+                  }}
                   style={styles.primaryPillBtn}>
                   <Text style={styles.primaryPillBtnText}>{t('inv_addItem')}</Text>
                 </Pressable>
               </View>
+
+              <Pressable
+                onPress={inventoryVoiceProcessing ? undefined : (voiceRecorderState.isRecording ? handleStopInventoryVoiceRecording : handleStartInventoryVoiceRecording)}
+                disabled={inventoryVoiceProcessing}
+                style={{
+                  flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
+                  backgroundColor: voiceRecorderState.isRecording ? colors.redBg : colors.brandBg,
+                  borderWidth: 1, borderColor: voiceRecorderState.isRecording ? colors.redBorder : '#C7D2FE',
+                  borderRadius: 10, paddingVertical: 10, marginBottom: 10,
+                  opacity: inventoryVoiceProcessing ? 0.6 : 1,
+                }}>
+                <Text style={{ color: voiceRecorderState.isRecording ? colors.red : colors.brand, fontSize: 12, fontWeight: '700' }}>
+                  {inventoryVoiceProcessing
+                    ? t('drv_voiceProcessing')
+                    : voiceRecorderState.isRecording
+                    ? t('drv_voiceStop')
+                    : t('inv_voiceAgentBtn')}
+                </Text>
+              </Pressable>
+              {(voiceRecorderState.isRecording || inventoryVoiceProcessing) && (
+                <Text style={{ fontSize: 11, color: colors.muted, textAlign: 'center', marginBottom: 10 }}>
+                  {voiceRecorderState.isRecording ? t('inv_voiceListeningHintAgent') : t('drv_voiceProcessingHint')}
+                </Text>
+              )}
 
               {inventory.length === 0 && !inventoryLoading && (
                 <Text style={styles.emptyStateText}>{t('inv_emptyState')}</Text>
@@ -7689,8 +8272,26 @@ function CustomerAppContent() {
           {/* Business Feature Tab: Daily Collection (Fruit/Vegetable & Retailer) */}
           {activeTab === 'daily_collection' && (hasFeature('inventory') || hasFeature('products')) && (
             <View>
-              <Text style={styles.sectionHeading}>{t('dc_heading')}</Text>
-              <View style={{ flexDirection: 'row', gap: 8, marginTop: 10, marginBottom: 14 }}>
+              <View style={styles.sectionHeaderRow}>
+                <Text style={styles.sectionHeading}>{t('dc_heading')}</Text>
+                <Pressable
+                  onPress={() => {
+                    const parsed = /^\d{4}-\d{2}-\d{2}$/.test(dcSelectedDate) ? new Date(dcSelectedDate + 'T00:00:00') : new Date();
+                    setDcCalendarMonth(isNaN(parsed.getTime()) ? new Date() : parsed);
+                    setShowDcCalendarPicker(true);
+                  }}
+                  style={{
+                    width: 40, height: 40, borderRadius: 10, alignItems: 'center', justifyContent: 'center',
+                    backgroundColor: colors.brandBg, borderWidth: 1, borderColor: '#C7D2FE',
+                  }}>
+                  <Text style={{ fontSize: 18 }}>📅</Text>
+                </Pressable>
+              </View>
+              <Text style={{ fontSize: 12, color: colors.muted, marginTop: -6, marginBottom: 14 }}>
+                {dcSelectedDate === formatDateISO(new Date()) ? t('common_today') : formatDisplayDate(dcSelectedDate)}
+              </Text>
+
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
                 <Pressable onPress={() => handleOpenRecordSale(undefined, 'SALE')} style={[styles.primaryPillBtn, { flex: 1, alignItems: 'center' }]}>
                   <Text style={styles.primaryPillBtnText}>🧾 {t('dc_sale')}</Text>
                 </Pressable>
@@ -7702,34 +8303,17 @@ function CustomerAppContent() {
                 </Pressable>
               </View>
 
-              <View style={styles.modePillRow}>
-                {([
-                  { key: 'daily', label: t('dc_daily') },
-                  { key: 'weekly', label: t('dc_weekly') },
-                  { key: 'monthly', label: t('dc_monthly') },
-                ] as const).map(p => (
-                  <Pressable
-                    key={p.key}
-                    onPress={() => setInventoryPeriod(p.key)}
-                    style={[styles.modePill, inventoryPeriod === p.key && styles.modePillActive]}>
-                    <Text style={[styles.modePillText, inventoryPeriod === p.key && styles.modePillTextActive]}>
-                      {p.label}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-
               <View style={styles.kpiRow}>
                 <View style={styles.kpiCard}>
                   <Text style={styles.kpiLabel}>{t('dc_totalCollected')}</Text>
                   <Text style={[styles.kpiValue, styles.textPositive]}>₹{(inventorySummary?.totalAmount || 0).toLocaleString()}</Text>
-                  <Text style={styles.kpiSub}>{inventoryPeriod === 'daily' ? t('common_today') : inventoryPeriod === 'weekly' ? t('common_thisWeek') : t('common_thisMonth')}</Text>
+                  <Text style={styles.kpiSub}>{dcSelectedDate === formatDateISO(new Date()) ? t('common_today') : formatDisplayDate(dcSelectedDate)}</Text>
                 </View>
-                <View style={styles.kpiCard}>
+                <Pressable style={styles.kpiCard} onPress={() => setShowPurchaseDetailModal(true)}>
                   <Text style={styles.kpiLabel}>{t('dc_purchases')}</Text>
                   <Text style={[styles.kpiValue, { color: '#D97706' }]}>₹{(inventorySummary?.purchaseValue || 0).toLocaleString()}</Text>
                   <Text style={styles.kpiSub}>{t('dc_unitsBought', { qty: inventorySummary?.purchaseQuantity || 0 })}</Text>
-                </View>
+                </Pressable>
               </View>
               <View style={styles.kpiRow}>
                 <View style={styles.kpiCard}>
@@ -7741,6 +8325,15 @@ function CustomerAppContent() {
                   <Text style={styles.kpiLabel}>{t('dc_transactions')}</Text>
                   <Text style={[styles.kpiValue, { color: colors.brand }]}>{inventorySummary?.totalCount || 0}</Text>
                   <Text style={styles.kpiSub}>{t('dc_recorded')}</Text>
+                </View>
+              </View>
+              <View style={styles.kpiRow}>
+                <View style={[styles.kpiCard, { flex: 1 }]}>
+                  <Text style={styles.kpiLabel}>{t('dc_netProfit')}</Text>
+                  <Text style={[styles.kpiValue, (inventorySummary?.netProfit || 0) >= 0 ? styles.textPositive : styles.textNegative]}>
+                    ₹{(inventorySummary?.netProfit || 0).toLocaleString()}
+                  </Text>
+                  <Text style={styles.kpiSub}>{t('dc_netProfitHint')}</Text>
                 </View>
               </View>
 
@@ -7764,15 +8357,29 @@ function CustomerAppContent() {
                       <View key={tx.id} style={styles.txTableRow}>
                         <View style={{ flex: 1.3 }}>
                           <Text style={styles.txTableCellName} numberOfLines={1}>{tx.productName}</Text>
-                          {isWastage && (
-                            <View style={styles.wastageTag}>
-                              <Text style={styles.wastageTagText}>{t('dc_wastageLabel')}</Text>
-                            </View>
-                          )}
-                          {isPurchase && (
-                            <View style={[styles.wastageTag, { backgroundColor: '#FFFBEB', borderColor: '#FDE68A' }]}>
-                              <Text style={[styles.wastageTagText, { color: '#B45309' }]}>{t('dc_purchases')}</Text>
-                            </View>
+                          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4, marginTop: 2 }}>
+                            {isWastage && (
+                              <View style={styles.wastageTag}>
+                                <Text style={styles.wastageTagText}>{t('dc_wastageLabel')}</Text>
+                              </View>
+                            )}
+                            {isPurchase && (
+                              <View style={[styles.wastageTag, { backgroundColor: '#FFFBEB', borderColor: '#FDE68A' }]}>
+                                <Text style={[styles.wastageTagText, { color: '#B45309' }]}>{t('dc_purchases')}</Text>
+                              </View>
+                            )}
+                            {isPurchase && tx.amountDue > 0 && (
+                              <View style={[styles.wastageTag, { backgroundColor: colors.redBg, borderColor: colors.redBorder }]}>
+                                <Text style={[styles.wastageTagText, { color: colors.red }]}>{t('dc_vendorDueShort')} ₹{tx.amountDue}</Text>
+                              </View>
+                            )}
+                          </View>
+                          {isPurchase && !!tx.note && (
+                            <Pressable onPress={() => handleOpenVendorLedger(tx.note)} hitSlop={4}>
+                              <Text style={{ fontSize: 11, color: colors.brand, fontWeight: '700', marginTop: 3, textDecorationLine: 'underline' }} numberOfLines={1}>
+                                🏪 {tx.note}
+                              </Text>
+                            </Pressable>
                           )}
                         </View>
                         <Text style={[styles.txTableCell, { flex: 0.8, textAlign: 'center' }]}>
@@ -7804,7 +8411,7 @@ function CustomerAppContent() {
                   <View style={styles.chartCardHeaderRow}>
                     <Text style={styles.chartCardTitle}>🍊 {t('dc_fruitwiseSales')}</Text>
                     <Text style={styles.chartCardBadge}>
-                      {inventoryPeriod === 'daily' ? t('common_today') : inventoryPeriod === 'weekly' ? t('common_thisWeek') : t('common_thisMonth')}
+                      {dcSelectedDate === formatDateISO(new Date()) ? t('common_today') : formatDisplayDate(dcSelectedDate)}
                     </Text>
                   </View>
                   {(() => {
@@ -7942,8 +8549,6 @@ function CustomerAppContent() {
 
               {[
                 { key: 'daily', title: `📅 ${t('ins_dayWise')}`, badge: t('ins_last7Days'), data: inventoryInsights?.dailyTrend, itemKey: 'date', from: '#818CF8', to: colors.brand },
-                { key: 'weekly', title: `📆 ${t('ins_weekWise')}`, badge: t('ins_last8Weeks'), data: inventoryInsights?.weeklyTrend, itemKey: 'weekStart', from: '#6EE7B7', to: colors.greenDark },
-                { key: 'monthly', title: `🗓️ ${t('ins_monthWise')}`, badge: t('ins_last6Months'), data: inventoryInsights?.monthlyTrend, itemKey: 'monthStart', from: '#94A3B8', to: colors.slateDark },
               ].map((chart) => {
                 const rows = (chart.data || []) as any[];
                 const max = Math.max(...rows.map((r) => r.amount), 1);
@@ -8102,6 +8707,61 @@ function CustomerAppContent() {
                   );
                 })()}
               </View>
+            </View>
+          )}
+
+          {/* Business Feature Tab: Vendors (Fruit/Vegetable & Retailer) - passbook of who's owed what */}
+          {activeTab === 'vendors' && (hasFeature('inventory') || hasFeature('products')) && (
+            <View>
+              <View style={styles.sectionHeaderRow}>
+                <Text style={styles.sectionHeading}>{t('nav_vendors')}</Text>
+                <Pressable onPress={handleOpenAddInventoryVendor} style={styles.primaryPillBtn}>
+                  <Text style={styles.primaryPillBtnText}>{t('dc_addVendor')}</Text>
+                </Pressable>
+              </View>
+              <Text style={{ fontSize: 12, color: colors.muted, marginTop: -6, marginBottom: 14 }}>
+                {t('dc_vendorsSubtitle')}
+              </Text>
+
+              {vendorsLoading && vendors.length === 0 && (
+                <ActivityIndicator color={colors.brand} style={{ marginVertical: 20 }} />
+              )}
+
+              {!vendorsLoading && vendors.length === 0 && (
+                <Text style={styles.emptyStateText}>{t('dc_noVendorsYet')}</Text>
+              )}
+
+              {vendors.map((v: any) => {
+                const due = v.totalDue || 0;
+                return (
+                  <Pressable
+                    key={v.vendorName}
+                    onPress={() => handleOpenVendorLedger(v.vendorName)}
+                    style={[styles.inventoryCard, { alignItems: 'center' }]}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.invItemName}>🏪 {v.vendorName}</Text>
+                      {!!v.mobileNumber && (
+                        <Text style={{ fontSize: 11, color: colors.slate, marginTop: 2 }}>📞 {v.mobileNumber}</Text>
+                      )}
+                      <Text style={{ fontSize: 11, color: colors.muted, marginTop: 2 }}>
+                        {v.lastActivity ? t('dc_vendorLastActivity', { date: formatDisplayDate(v.lastActivity) }) : ''}
+                      </Text>
+                    </View>
+                    <View style={{ alignItems: 'flex-end' }}>
+                      {due > 0 ? (
+                        <>
+                          <Text style={{ fontSize: 15, fontWeight: '800', color: colors.red }}>₹{due.toLocaleString()}</Text>
+                          <Text style={{ fontSize: 10, color: colors.muted }}>{t('dc_vendorDueShort')}</Text>
+                        </>
+                      ) : (
+                        <View style={[styles.stockBadge, styles.stockBadgeOk]}>
+                          <Text style={[styles.stockBadgeText, styles.stockBadgeTextOk]}>{t('dc_paidInFull')}</Text>
+                        </View>
+                      )}
+                    </View>
+                  </Pressable>
+                );
+              })}
             </View>
           )}
 
@@ -11345,7 +12005,7 @@ function CustomerAppContent() {
                   style={[styles.modalInput, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }]}>
                   <Text style={{ fontSize: 14, color: tripBusNumberInput ? colors.navy : colors.muted, fontWeight: tripBusNumberInput ? '700' : '400' }}>
                     {tripBusNumberInput
-                      ? `🚌 ${tripBusNumberInput}${travelVehicles.some(v => v.regNumber === tripBusNumberInput) ? (tripBusTypeInput === 'sleeper' ? `  🛏️ ${t('trv_sleeper')}` : `  💺 ${t('trv_seater')}`) : ''}`
+                      ? `🚌 ${tripBusNumberInput}${travelVehicles.some(v => v.regNumber === tripBusNumberInput) ? `  ${vehicleTypeIconLabel(tripBusTypeInput)}` : ''}`
                       : t('trv_selectBusPlaceholder')}
                   </Text>
                   <Text style={{ fontSize: 12, color: colors.muted }}>{showTripBusDropdown ? '▲' : '▼'}</Text>
@@ -11372,7 +12032,7 @@ function CustomerAppContent() {
                           </View>
                         </View>
                         <Text style={{ fontSize: 12, fontWeight: '700', color: colors.brand }}>
-                          {v.busType === 'sleeper' ? `🛏️ ${t('trv_sleeper')}` : `💺 ${t('trv_seater')}`}
+                          {vehicleTypeIconLabel(v.busType === 'sleeper' ? 'sleeper' : v.busType === 'ertiga' ? 'ertiga' : 'seater')}
                         </Text>
                       </Pressable>
                     ))}
@@ -11387,26 +12047,12 @@ function CustomerAppContent() {
                 onChangeText={t => { setTripBusNumberInput(t); setShowTripBusDropdown(false); }}
               />
               <Text style={styles.fieldLabel}>{t('trv_busType')}</Text>
-              <View style={{ flexDirection: 'row', gap: 10, marginBottom: 14 }}>
-                {(['seater', 'sleeper'] as const).map(opt => (
-                  <Pressable
-                    key={opt}
-                    onPress={() => handleSelectBusType(opt)}
-                    style={{
-                      flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
-                      paddingVertical: 12, borderRadius: 12,
-                      backgroundColor: tripBusTypeInput === opt ? colors.brandBg : colors.page,
-                      borderWidth: 1.5, borderColor: tripBusTypeInput === opt ? colors.brand : colors.border,
-                    }}>
-                    <Text style={{ fontSize: 16 }}>{opt === 'seater' ? '💺' : '🛏️'}</Text>
-                    <Text style={{ fontSize: 13, fontWeight: '800', color: tripBusTypeInput === opt ? colors.brand : colors.slate }}>
-                      {opt === 'seater' ? t('trv_seater') : t('trv_sleeper')}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
+              <Pressable onPress={() => setShowTripBusTypeDropdown(true)} style={styles.selectBox}>
+                <Text style={styles.selectBoxText}>{vehicleTypeIconLabel(tripBusTypeInput)}</Text>
+                <Text style={styles.selectBoxChevron}>▾</Text>
+              </Pressable>
 
-              {tripBusTypeInput === 'seater' ? (
+              {tripBusTypeInput !== 'sleeper' ? (
                 <>
                   <Text style={styles.fieldLabel}>💺 {t('trv_totalSeats')}</Text>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 14 }}>
@@ -11486,6 +12132,35 @@ function CustomerAppContent() {
           </View>
         </Modal>
 
+        {/* Modal: Trip Vehicle Type Dropdown (New Trip) */}
+        <Modal visible={showTripBusTypeDropdown} animationType="slide" transparent onRequestClose={() => setShowTripBusTypeDropdown(false)}>
+          <Pressable style={styles.modalOverlay} onPress={() => setShowTripBusTypeDropdown(false)}>
+            <Pressable style={styles.dropdownModalContent} onPress={() => {}}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>{t('trv_busType')}</Text>
+                <Pressable onPress={() => setShowTripBusTypeDropdown(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              <ScrollView style={styles.dropdownList}>
+                {(['seater', 'sleeper', 'ertiga'] as const).map(opt => (
+                  <Pressable
+                    key={opt}
+                    onPress={() => {
+                      handleSelectBusType(opt);
+                      setShowTripBusTypeDropdown(false);
+                    }}
+                    style={[styles.dropdownOption, tripBusTypeInput === opt && styles.dropdownOptionActive]}>
+                    <Text style={[styles.dropdownOptionText, tripBusTypeInput === opt && styles.dropdownOptionTextActive]}>
+                      {vehicleTypeIconLabel(opt)}
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
         {/* Modal: Travel Date calendar picker (Travels Bus Booking Online) */}
         <Modal visible={showTripDatePicker} animationType="fade" transparent onRequestClose={() => setShowTripDatePicker(false)}>
           <Pressable style={styles.modalOverlay} onPress={() => setShowTripDatePicker(false)}>
@@ -11527,6 +12202,320 @@ function CustomerAppContent() {
               )}
             </Pressable>
           </Pressable>
+        </Modal>
+
+        {/* Modal: Daily Collection - pick a date to view (Fruit Sellers / Retailers) */}
+        <Modal visible={showDcCalendarPicker} animationType="fade" transparent onRequestClose={() => setShowDcCalendarPicker(false)}>
+          <Pressable style={styles.modalOverlay} onPress={() => setShowDcCalendarPicker(false)}>
+            <Pressable style={styles.modalContent} onPress={e => e.stopPropagation()}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>📅 {t('dc_pickDate')}</Text>
+                <Pressable onPress={() => setShowDcCalendarPicker(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              {renderCalendarPicker(dcCalendarMonth, dcSelectedDate, shiftDcCalendarMonth, (iso) => {
+                setDcSelectedDate(iso);
+                setShowDcCalendarPicker(false);
+              })}
+            </Pressable>
+          </Pressable>
+        </Modal>
+
+        {/* Modal: Daily Collection - Purchase details (Product, Qty, Date, Vendor) */}
+        <Modal visible={showPurchaseDetailModal} animationType="slide" transparent onRequestClose={() => setShowPurchaseDetailModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>📥 {t('dc_purchaseDetailsTitle')}</Text>
+                <Pressable onPress={() => setShowPurchaseDetailModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              <Text style={{ fontSize: 12, color: colors.muted, marginBottom: 12 }}>
+                {dcSelectedDate === formatDateISO(new Date()) ? t('common_today') : formatDisplayDate(dcSelectedDate)}
+              </Text>
+              {(() => {
+                const purchases = inventoryTransactions.filter((tx: any) => tx.type === 'PURCHASE');
+                if (purchases.length === 0) {
+                  return <Text style={styles.emptyStateText}>{t('dc_noPurchasesPeriod')}</Text>;
+                }
+                return (
+                  <ScrollView style={{ maxHeight: 420 }}>
+                    <View style={styles.txTableWrap}>
+                      <View style={styles.txTableHeaderRow}>
+                        <Text style={[styles.txTableHeaderText, { flex: 1.2 }]}>{t('dc_product')}</Text>
+                        <Text style={[styles.txTableHeaderText, { flex: 0.8, textAlign: 'center' }]}>{t('dc_qty')}</Text>
+                        <Text style={[styles.txTableHeaderText, { flex: 0.9, textAlign: 'center' }]}>{t('dc_date')}</Text>
+                        <Text style={[styles.txTableHeaderText, { flex: 1.1, textAlign: 'right' }]}>{t('dc_vendor')}</Text>
+                      </View>
+                      {purchases.map((tx: any) => (
+                        <View key={tx.id} style={styles.txTableRow}>
+                          <Text style={[styles.txTableCellName, { flex: 1.2 }]} numberOfLines={1}>{tx.productName}</Text>
+                          <Text style={[styles.txTableCell, { flex: 0.8, textAlign: 'center' }]}>{tx.quantity} {tx.unit}</Text>
+                          <Text style={[styles.txTableCell, { flex: 0.9, textAlign: 'center' }]}>{tx.date}</Text>
+                          {tx.note ? (
+                            <Pressable
+                              style={{ flex: 1.1 }}
+                              onPress={() => {
+                                setShowPurchaseDetailModal(false);
+                                handleOpenVendorLedger(tx.note);
+                              }}>
+                              <Text style={[styles.txTableCell, { textAlign: 'right', color: colors.brand, fontWeight: '700', textDecorationLine: 'underline' }]} numberOfLines={1}>
+                                {tx.note}
+                              </Text>
+                            </Pressable>
+                          ) : (
+                            <Text style={[styles.txTableCell, { flex: 1.1, textAlign: 'right' }]} numberOfLines={1}>{t('dc_vendorUnknown')}</Text>
+                          )}
+                        </View>
+                      ))}
+                    </View>
+                  </ScrollView>
+                );
+              })()}
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Add Vendor - proactively save a vendor's contact details */}
+        <Modal visible={showAddVendorModal} animationType="slide" transparent onRequestClose={() => setShowAddVendorModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>🏪 {t('dc_addVendorTitle')}</Text>
+                <Pressable onPress={() => setShowAddVendorModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorNameLabel')}</Text>
+              <TextInput
+                placeholder={t('dc_vendorNamePlaceholder')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newVendorName}
+                onChangeText={setNewVendorName}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorMobileLabel')}</Text>
+              <TextInput
+                keyboardType="phone-pad"
+                placeholder="e.g. 9876543210"
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newVendorMobile}
+                onChangeText={setNewVendorMobile}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorEmailLabel')}</Text>
+              <TextInput
+                keyboardType="email-address"
+                autoCapitalize="none"
+                placeholder="e.g. rishi@example.com"
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newVendorEmail}
+                onChangeText={setNewVendorEmail}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorAddressLabel')}</Text>
+              <TextInput
+                placeholder={t('dc_vendorAddressPlaceholder')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newVendorAddress}
+                onChangeText={setNewVendorAddress}
+              />
+
+              <Pressable
+                onPress={handleAddVendor}
+                disabled={addVendorLoading}
+                style={[styles.modalSubmitBtn, addVendorLoading && { opacity: 0.6 }]}>
+                <Text style={styles.modalSubmitBtnText}>{addVendorLoading ? t('common_saving') : t('dc_addVendor')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Vendor Ledger - all purchases from + payments to one vendor, with running due */}
+        <Modal visible={showVendorLedgerModal} animationType="slide" transparent onRequestClose={() => setShowVendorLedgerModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>🏪 {vendorLedgerName}</Text>
+                <Pressable onPress={() => setShowVendorLedgerModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              {!!(vendorLedger?.mobileNumber || vendorLedger?.email) && (
+                <Text style={{ fontSize: 12, color: colors.muted, marginTop: -8, marginBottom: 10 }}>
+                  {[vendorLedger?.mobileNumber, vendorLedger?.email].filter(Boolean).join(' · ')}
+                </Text>
+              )}
+
+              {vendorLedgerLoading && !vendorLedger && (
+                <ActivityIndicator color={colors.brand} style={{ marginVertical: 20 }} />
+              )}
+
+              {vendorLedger && (
+                <ScrollView style={{ maxHeight: 480 }}>
+                  <View style={styles.kpiRow}>
+                    <View style={styles.kpiCard}>
+                      <Text style={styles.kpiLabel}>{t('dc_vendorTotalPurchased')}</Text>
+                      <Text style={[styles.kpiValue, { color: colors.brand }]}>₹{(vendorLedger.totals?.totalCost || 0).toLocaleString()}</Text>
+                    </View>
+                    <View style={styles.kpiCard}>
+                      <Text style={styles.kpiLabel}>{t('dc_vendorTotalPaid')}</Text>
+                      <Text style={[styles.kpiValue, styles.textPositive]}>₹{(vendorLedger.totals?.totalPaid || 0).toLocaleString()}</Text>
+                    </View>
+                  </View>
+                  <View style={styles.kpiRow}>
+                    <View style={[styles.kpiCard, { flex: 1 }]}>
+                      <Text style={styles.kpiLabel}>{t('dc_vendorTotalDue')}</Text>
+                      <Text style={[styles.kpiValue, (vendorLedger.totals?.totalDue || 0) > 0 ? styles.textNegative : styles.textPositive]}>
+                        ₹{(vendorLedger.totals?.totalDue || 0).toLocaleString()}
+                      </Text>
+                    </View>
+                  </View>
+
+                  {(vendorLedger.totals?.totalDue || 0) > 0 && (
+                    <Pressable onPress={handleOpenPayVendor} style={[styles.primaryPillBtn, { alignItems: 'center', marginTop: 4, marginBottom: 16 }]}>
+                      <Text style={styles.primaryPillBtnText}>💸 {t('dc_payVendorBtn')}</Text>
+                    </Pressable>
+                  )}
+
+                  <Text style={styles.chartCardTitle}>📖 {t('dc_vendorPassbookTitle')}</Text>
+                  {(() => {
+                    type PassbookRow = { key: string; date: string; icon: string; label: string; sub: string; delta: number };
+                    const rows: PassbookRow[] = [];
+                    (vendorLedger.purchases || []).forEach((p: any) => {
+                      rows.push({
+                        key: `purchase-${p.id}`,
+                        date: p.date,
+                        icon: '📥',
+                        label: `${t('dc_vendorGotEntry')}: ${p.productName}`,
+                        sub: `${p.quantity} ${p.unit}`,
+                        delta: p.totalCost,
+                      });
+                      if (p.amountPaid > 0) {
+                        rows.push({
+                          key: `purchase-paid-${p.id}`,
+                          date: p.date,
+                          icon: '💵',
+                          label: t('dc_vendorGaveEntry'),
+                          sub: t('dc_vendorPaidAtPurchase'),
+                          delta: -p.amountPaid,
+                        });
+                      }
+                    });
+                    (vendorLedger.payments || []).forEach((p: any) => {
+                      rows.push({
+                        key: `payment-${p.id}`,
+                        date: p.date,
+                        icon: '💸',
+                        label: t('dc_vendorGaveEntry'),
+                        sub: p.note ? `${p.paymentMethod} · ${p.note}` : p.paymentMethod,
+                        delta: -p.amount,
+                      });
+                    });
+                    if (rows.length === 0) {
+                      return <Text style={styles.emptyStateText}>{t('dc_noVendorActivity')}</Text>;
+                    }
+                    rows.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+                    let running = 0;
+                    const withBalance = rows.map(r => {
+                      running += r.delta;
+                      return { ...r, balance: running };
+                    });
+                    withBalance.reverse();
+                    return (
+                      <View style={{ marginTop: 8 }}>
+                        {withBalance.map(r => (
+                          <View key={r.key} style={{
+                            flexDirection: 'row', alignItems: 'center', paddingVertical: 10,
+                            borderBottomWidth: 1, borderBottomColor: colors.border,
+                          }}>
+                            <Text style={{ fontSize: 18, marginRight: 10 }}>{r.icon}</Text>
+                            <View style={{ flex: 1 }}>
+                              <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{r.label}</Text>
+                              <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }} numberOfLines={1}>{r.sub} · {r.date}</Text>
+                            </View>
+                            <View style={{ alignItems: 'flex-end' }}>
+                              <Text style={{ fontSize: 14, fontWeight: '800', color: r.delta >= 0 ? '#B45309' : colors.greenDark }}>
+                                {r.delta >= 0 ? '+' : '−'}₹{Math.abs(r.delta).toLocaleString()}
+                              </Text>
+                              <Text style={{ fontSize: 10, color: colors.muted, marginTop: 1 }}>
+                                {t('dc_vendorBalance')} ₹{r.balance.toLocaleString()}
+                              </Text>
+                            </View>
+                          </View>
+                        ))}
+                      </View>
+                    );
+                  })()}
+                </ScrollView>
+              )}
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Pay Vendor - record a follow-up payment against a vendor's due balance */}
+        <Modal visible={showPayVendorModal} animationType="slide" transparent onRequestClose={() => setShowPayVendorModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>💸 {t('dc_payVendorTitle', { vendor: vendorLedgerName })}</Text>
+                <Pressable onPress={() => setShowPayVendorModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_amountLabel')}</Text>
+              <TextInput
+                keyboardType="numeric"
+                placeholder="e.g. 500"
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={payVendorAmount}
+                onChangeText={setPayVendorAmount}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_paymentMethod')}</Text>
+              <View style={styles.modePillRow}>
+                {([
+                  { key: 'CASH' as const, label: t('common_cash') },
+                  { key: 'UPI' as const, label: t('common_upi') },
+                  { key: 'CREDIT' as const, label: t('common_credit') },
+                ]).map(pm => (
+                  <Pressable
+                    key={pm.key}
+                    onPress={() => setPayVendorMethod(pm.key)}
+                    style={[styles.modePill, payVendorMethod === pm.key && styles.modePillActive]}>
+                    <Text style={[styles.modePillText, payVendorMethod === pm.key && styles.modePillTextActive]}>
+                      {pm.label}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_noteOptional')}</Text>
+              <TextInput
+                placeholder={t('dc_notePlaceholder')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={payVendorNote}
+                onChangeText={setPayVendorNote}
+              />
+
+              <Pressable
+                onPress={handleRecordVendorPayment}
+                disabled={payVendorLoading}
+                style={[styles.modalSubmitBtn, payVendorLoading && { opacity: 0.6 }]}>
+                <Text style={styles.modalSubmitBtnText}>{payVendorLoading ? t('common_saving') : t('dc_payVendorBtn')}</Text>
+              </Pressable>
+            </View>
+          </View>
         </Modal>
 
         {/* Modal: Driver Reports - custom range "from" date */}
@@ -11830,10 +12819,55 @@ function CustomerAppContent() {
                       <Text style={styles.modalSubmitBtnText}>💬 {t('trv_sendWhatsAppConfirmation')}</Text>
                     </Pressable>
                   )}
+
+                  {!!activeSeat.booking.mobileNumber && travelSelectedTrip && (
+                    <Pressable
+                      onPress={() => handleDraftReminder(travelSelectedTrip.id, activeSeat.seatNumber, activeSeat.booking.mobileNumber)}
+                      disabled={draftingReminder}
+                      style={[
+                        styles.modalSubmitBtn,
+                        { backgroundColor: colors.brand, marginBottom: 10 },
+                        draftingReminder && { opacity: 0.6 },
+                      ]}>
+                      <Text style={styles.modalSubmitBtnText}>
+                        {draftingReminder ? t('trv_reminderDrafting') : t('trv_remindBtn')}
+                      </Text>
+                    </Pressable>
+                  )}
                 </View>
               )}
               <Pressable onPress={handleCancelSeatBooking} style={[styles.modalSubmitBtn, { backgroundColor: colors.red }]}>
                 <Text style={styles.modalSubmitBtnText}>{t('trv_cancelBooking')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: AI-Drafted Passenger Reminder */}
+        <Modal visible={showReminderModal} animationType="fade" transparent onRequestClose={() => setShowReminderModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>📨 {t('trv_reminderDraftTitle')}</Text>
+                <Pressable onPress={() => setShowReminderModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              <Text style={{ fontSize: 12, color: colors.muted, marginBottom: 12 }}>{t('trv_reminderDraftHint')}</Text>
+              <TextInput
+                multiline
+                numberOfLines={5}
+                style={[styles.modalInput, { minHeight: 110, textAlignVertical: 'top' }]}
+                value={reminderDraftText}
+                onChangeText={setReminderDraftText}
+              />
+              <Pressable
+                onPress={() => {
+                  sendBookingWhatsApp(reminderMobile, reminderDraftText);
+                  setShowReminderModal(false);
+                }}
+                style={[styles.modalSubmitBtn, { backgroundColor: '#25D366', marginTop: 14 }]}>
+                <Text style={styles.modalSubmitBtnText}>💬 {t('trv_reminderSendWhatsapp')}</Text>
               </Pressable>
             </View>
           </View>
@@ -12191,24 +13225,10 @@ function CustomerAppContent() {
               />
 
               <Text style={styles.fieldLabel}>{t('trv_busType')}</Text>
-              <View style={{ flexDirection: 'row', gap: 10, marginBottom: 14 }}>
-                {(['seater', 'sleeper'] as const).map(opt => (
-                  <Pressable
-                    key={opt}
-                    onPress={() => setVehBusTypeInput(opt)}
-                    style={{
-                      flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
-                      paddingVertical: 12, borderRadius: 12,
-                      backgroundColor: vehBusTypeInput === opt ? colors.brandBg : colors.page,
-                      borderWidth: 1.5, borderColor: vehBusTypeInput === opt ? colors.brand : colors.border,
-                    }}>
-                    <Text style={{ fontSize: 16 }}>{opt === 'seater' ? '💺' : '🛏️'}</Text>
-                    <Text style={{ fontSize: 13, fontWeight: '800', color: vehBusTypeInput === opt ? colors.brand : colors.slate }}>
-                      {opt === 'seater' ? t('trv_seater') : t('trv_sleeper')}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
+              <Pressable onPress={() => setShowVehBusTypeDropdown(true)} style={styles.selectBox}>
+                <Text style={styles.selectBoxText}>{vehicleTypeIconLabel(vehBusTypeInput)}</Text>
+                <Text style={styles.selectBoxChevron}>▾</Text>
+              </Pressable>
 
               <Text style={styles.fieldLabel}>{t('fuel_type')}</Text>
               <View style={styles.modePillRow}>
@@ -12284,6 +13304,35 @@ function CustomerAppContent() {
           </View>
         </Modal>
 
+        {/* Modal: Vehicle Type Dropdown (Add Vehicle) */}
+        <Modal visible={showVehBusTypeDropdown} animationType="slide" transparent onRequestClose={() => setShowVehBusTypeDropdown(false)}>
+          <Pressable style={styles.modalOverlay} onPress={() => setShowVehBusTypeDropdown(false)}>
+            <Pressable style={styles.dropdownModalContent} onPress={() => {}}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>{t('trv_busType')}</Text>
+                <Pressable onPress={() => setShowVehBusTypeDropdown(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              <ScrollView style={styles.dropdownList}>
+                {(['seater', 'sleeper', 'ertiga'] as const).map(opt => (
+                  <Pressable
+                    key={opt}
+                    onPress={() => {
+                      setVehBusTypeInput(opt);
+                      setShowVehBusTypeDropdown(false);
+                    }}
+                    style={[styles.dropdownOption, vehBusTypeInput === opt && styles.dropdownOptionActive]}>
+                    <Text style={[styles.dropdownOptionText, vehBusTypeInput === opt && styles.dropdownOptionTextActive]}>
+                      {vehicleTypeIconLabel(opt)}
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
         {/* Modal: Add Product (Fruit Sellers / Retailers) */}
         <Modal visible={showAddProductModal} animationType="slide" transparent>
           <View style={styles.modalOverlay}>
@@ -12294,6 +13343,15 @@ function CustomerAppContent() {
                   <Text style={styles.modalCloseText}>✕</Text>
                 </Pressable>
               </View>
+
+              {!!inventoryVoiceTranscript && (
+                <View style={{ backgroundColor: colors.brandBg, borderRadius: 10, padding: 10, marginBottom: 12 }}>
+                  <Text style={{ fontSize: 11, fontWeight: '700', color: colors.brand, marginBottom: 2 }}>
+                    🎤 {t('drv_voiceHeard')}
+                  </Text>
+                  <Text style={{ fontSize: 12, color: colors.slate, fontStyle: 'italic' }}>"{inventoryVoiceTranscript}"</Text>
+                </View>
+              )}
 
               <Text style={styles.fieldLabel}>{t('inv_productName')}</Text>
               <TextInput
@@ -12377,10 +13435,29 @@ function CustomerAppContent() {
                 </View>
               </View>
 
+              {!!inventoryVoiceTranscript && (
+                <Pressable
+                  onPress={() => setInventoryVoiceConfirmed(v => !v)}
+                  style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4, marginBottom: 12 }}>
+                  <View style={{
+                    width: 20, height: 20, borderRadius: 5, borderWidth: 1.5,
+                    borderColor: inventoryVoiceConfirmed ? colors.brand : colors.border,
+                    backgroundColor: inventoryVoiceConfirmed ? colors.brand : 'transparent',
+                    alignItems: 'center', justifyContent: 'center',
+                  }}>
+                    {inventoryVoiceConfirmed && <Text style={{ color: '#fff', fontSize: 12, fontWeight: '800' }}>✓</Text>}
+                  </View>
+                  <Text style={{ fontSize: 12, color: colors.slate, flex: 1 }}>{t('drv_voiceConfirmCheckbox')}</Text>
+                </Pressable>
+              )}
+
               <Pressable
                 onPress={handleAddProduct}
-                disabled={addProductLoading}
-                style={[styles.modalSubmitBtn, addProductLoading && { opacity: 0.6 }]}>
+                disabled={addProductLoading || (!!inventoryVoiceTranscript && !inventoryVoiceConfirmed)}
+                style={[
+                  styles.modalSubmitBtn,
+                  (addProductLoading || (!!inventoryVoiceTranscript && !inventoryVoiceConfirmed)) && { opacity: 0.6 },
+                ]}>
                 <Text style={styles.modalSubmitBtnText}>{addProductLoading ? t('common_saving') : t('inv_saveProduct')}</Text>
               </Pressable>
             </View>
@@ -12399,6 +13476,15 @@ function CustomerAppContent() {
                   <Text style={styles.modalCloseText}>✕</Text>
                 </Pressable>
               </View>
+
+              {!!inventoryVoiceTranscript && (
+                <View style={{ backgroundColor: colors.brandBg, borderRadius: 10, padding: 10, marginBottom: 12 }}>
+                  <Text style={{ fontSize: 11, fontWeight: '700', color: colors.brand, marginBottom: 2 }}>
+                    🎤 {t('drv_voiceHeard')}
+                  </Text>
+                  <Text style={{ fontSize: 12, color: colors.slate, fontStyle: 'italic' }}>"{inventoryVoiceTranscript}"</Text>
+                </View>
+              )}
 
               <View style={styles.modePillRow}>
                 {(['SALE', 'PURCHASE', 'WASTAGE'] as const).map(st => (
@@ -12456,7 +13542,7 @@ function CustomerAppContent() {
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.fieldLabel}>
-                    {saleType === 'WASTAGE' ? t('dc_lossValueOptional') : saleType === 'PURCHASE' ? t('dc_amountPaid') : t('dc_amountLabel')}
+                    {saleType === 'WASTAGE' ? t('dc_lossValueOptional') : saleType === 'PURCHASE' ? t('dc_totalCost') : t('dc_amountLabel')}
                   </Text>
                   <TextInput
                     keyboardType="numeric"
@@ -12472,6 +13558,23 @@ function CustomerAppContent() {
                 <Text style={{ fontSize: 11, color: colors.muted, marginTop: -6, marginBottom: 10 }}>
                   {t('dc_lossValueHint')}
                 </Text>
+              )}
+
+              {saleType === 'PURCHASE' && (
+                <>
+                  <Text style={styles.fieldLabel}>{t('dc_paidNow')}</Text>
+                  <TextInput
+                    keyboardType="numeric"
+                    placeholder={saleAmount ? saleAmount : 'e.g. 1000'}
+                    placeholderTextColor={colors.muted}
+                    style={styles.modalInput}
+                    value={salePaidNow}
+                    onChangeText={setSalePaidNow}
+                  />
+                  <Text style={{ fontSize: 11, color: colors.muted, marginTop: -6, marginBottom: 10 }}>
+                    {t('dc_paidNowHint')}
+                  </Text>
+                </>
               )}
 
               {saleType === 'SALE' && (
@@ -12497,24 +13600,80 @@ function CustomerAppContent() {
               )}
 
               <Text style={styles.fieldLabel}>
-                {saleType === 'WASTAGE' ? t('dc_reasonOptional') : saleType === 'PURCHASE' ? t('dc_supplierNoteOptional') : t('dc_noteOptional')}
+                {saleType === 'WASTAGE' ? t('dc_reasonOptional') : saleType === 'PURCHASE' ? t('dc_vendorNameLabel') : t('dc_noteOptional')}
               </Text>
-              <TextInput
-                placeholder={saleType === 'WASTAGE' ? t('dc_reasonPlaceholder') : saleType === 'PURCHASE' ? t('dc_supplierPlaceholder') : t('dc_notePlaceholder')}
-                placeholderTextColor={colors.muted}
-                style={styles.modalInput}
-                value={saleNote}
-                onChangeText={setSaleNote}
-              />
+              {saleType === 'PURCHASE' ? (
+                <>
+                  <View style={{ flexDirection: 'row', gap: 8 }}>
+                    <TextInput
+                      placeholder={t('dc_vendorNamePlaceholder')}
+                      placeholderTextColor={colors.muted}
+                      style={[styles.modalInput, { flex: 1 }]}
+                      value={saleNote}
+                      onChangeText={text => { setSaleNote(text); setShowVendorPicker(true); }}
+                      onFocus={() => setShowVendorPicker(true)}
+                    />
+                    <Pressable
+                      onPress={() => setShowVendorPicker(prev => !prev)}
+                      style={{
+                        width: 46, height: 46, borderRadius: 10, alignItems: 'center', justifyContent: 'center',
+                        backgroundColor: colors.brandBg, borderWidth: 1, borderColor: '#C7D2FE',
+                      }}>
+                      <Text style={{ fontSize: 14, color: colors.brand }}>{showVendorPicker ? '▲' : '▼'}</Text>
+                    </Pressable>
+                  </View>
+                  {showVendorPicker && (() => {
+                    const query = saleNote.trim().toLowerCase();
+                    const matches = vendors.filter((v: any) => !query || v.vendorName.toLowerCase().includes(query));
+                    if (matches.length === 0) return null;
+                    return (
+                      <View style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, marginTop: 6, marginBottom: 10, overflow: 'hidden' }}>
+                        {matches.map((v: any) => (
+                          <Pressable
+                            key={v.vendorName}
+                            onPress={() => { setSaleNote(v.vendorName); setShowVendorPicker(false); }}
+                            style={{ paddingVertical: 10, paddingHorizontal: 12, backgroundColor: v.vendorName === saleNote ? '#EEF2FF' : '#fff' }}>
+                            <Text style={{ color: colors.navy }}>🏪 {v.vendorName}</Text>
+                          </Pressable>
+                        ))}
+                      </View>
+                    );
+                  })()}
+                </>
+              ) : (
+                <TextInput
+                  placeholder={saleType === 'WASTAGE' ? t('dc_reasonPlaceholder') : t('dc_notePlaceholder')}
+                  placeholderTextColor={colors.muted}
+                  style={styles.modalInput}
+                  value={saleNote}
+                  onChangeText={setSaleNote}
+                />
+              )}
+
+              {!!inventoryVoiceTranscript && (
+                <Pressable
+                  onPress={() => setInventoryVoiceConfirmed(v => !v)}
+                  style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4, marginBottom: 12 }}>
+                  <View style={{
+                    width: 20, height: 20, borderRadius: 5, borderWidth: 1.5,
+                    borderColor: inventoryVoiceConfirmed ? colors.brand : colors.border,
+                    backgroundColor: inventoryVoiceConfirmed ? colors.brand : 'transparent',
+                    alignItems: 'center', justifyContent: 'center',
+                  }}>
+                    {inventoryVoiceConfirmed && <Text style={{ color: '#fff', fontSize: 12, fontWeight: '800' }}>✓</Text>}
+                  </View>
+                  <Text style={{ fontSize: 12, color: colors.slate, flex: 1 }}>{t('drv_voiceConfirmCheckbox')}</Text>
+                </Pressable>
+              )}
 
               <Pressable
                 onPress={handleRecordSale}
-                disabled={recordSaleLoading}
+                disabled={recordSaleLoading || (!!inventoryVoiceTranscript && !inventoryVoiceConfirmed)}
                 style={[
                   styles.modalSubmitBtn,
                   saleType === 'WASTAGE' && { backgroundColor: colors.red },
                   saleType === 'PURCHASE' && { backgroundColor: '#D97706' },
-                  recordSaleLoading && { opacity: 0.6 },
+                  (recordSaleLoading || (!!inventoryVoiceTranscript && !inventoryVoiceConfirmed)) && { opacity: 0.6 },
                 ]}>
                 <Text style={styles.modalSubmitBtnText}>
                   {recordSaleLoading ? t('common_saving') : saleType === 'WASTAGE' ? t('dc_saveWastage') : saleType === 'PURCHASE' ? t('dc_savePurchase') : t('dc_saveTransaction')}
@@ -13908,46 +15067,105 @@ function CustomerAppContent() {
           </Text>
         </View>
 
-        {showPinScreen ? (
-          /* PIN Unlock Card */
+        {pinLoginAvailable ? (
+          /* Two-way login: PIN or Email & DOB, chosen via a visible toggle */
           <View style={styles.authFormCard}>
-            <Text style={styles.formTitle}>
-              {pinLoginName ? t('pin_welcomeBack', { name: pinLoginName.split(' ')[0] }) : t('pin_welcomeBackGeneric')}
-            </Text>
-            <Text style={styles.formSubtitle}>{t('pin_enterHint')}</Text>
+            <View style={styles.modePillRow}>
+              <Pressable
+                onPress={() => {
+                  setShowPinScreen(true);
+                  setPinError('');
+                }}
+                style={[styles.modePill, showPinScreen && styles.modePillActive]}>
+                <Text style={[styles.modePillText, showPinScreen && styles.modePillTextActive]}>{t('pin_loginMethodPin')}</Text>
+              </Pressable>
+              <Pressable onPress={handleUseFullLoginInstead} style={[styles.modePill, !showPinScreen && styles.modePillActive]}>
+                <Text style={[styles.modePillText, !showPinScreen && styles.modePillTextActive]}>{t('pin_loginMethodCredentials')}</Text>
+              </Pressable>
+            </View>
 
-            <TextInput
-              autoFocus
-              keyboardType="number-pad"
-              secureTextEntry
-              maxLength={6}
-              placeholder="••••"
-              placeholderTextColor={colors.muted}
-              style={[styles.authInput, { textAlign: 'center', fontSize: 28, letterSpacing: 12 }]}
-              value={pinInput}
-              onChangeText={(v) => {
-                setPinInput(v.replace(/[^0-9]/g, ''));
-                setPinError('');
-              }}
-              onSubmitEditing={handlePinSubmit}
-            />
+            {showPinScreen ? (
+              <>
+                <Text style={styles.formTitle}>
+                  {pinLoginName ? t('pin_welcomeBack', { name: pinLoginName.split(' ')[0] }) : t('pin_welcomeBackGeneric')}
+                </Text>
+                <Text style={styles.formSubtitle}>{t('pin_enterHint')}</Text>
 
-            {!!pinError && (
-              <View style={styles.errorBox}>
-                <Text style={styles.errorText}>⚠️ {pinError}</Text>
-              </View>
+                <TextInput
+                  autoFocus
+                  keyboardType="number-pad"
+                  secureTextEntry
+                  maxLength={6}
+                  placeholder="••••"
+                  placeholderTextColor={colors.muted}
+                  style={[styles.authInput, { textAlign: 'center', fontSize: 28, letterSpacing: 12 }]}
+                  value={pinInput}
+                  onChangeText={(v) => {
+                    setPinInput(v.replace(/[^0-9]/g, ''));
+                    setPinError('');
+                  }}
+                  onSubmitEditing={handlePinSubmit}
+                />
+
+                {!!pinError && (
+                  <View style={styles.errorBox}>
+                    <Text style={styles.errorText}>⚠️ {pinError}</Text>
+                  </View>
+                )}
+
+                <Pressable
+                  onPress={handlePinSubmit}
+                  disabled={pinUnlocking || pinInput.length < 4}
+                  style={[styles.signInButton, (pinUnlocking || pinInput.length < 4) && { opacity: 0.6 }]}>
+                  <Text style={styles.signInButtonText}>{pinUnlocking ? t('common_loading') : t('pin_unlock')}</Text>
+                </Pressable>
+              </>
+            ) : (
+              <>
+                <Text style={styles.formTitle}>Sign In to Your Ledger</Text>
+                <Text style={styles.formSubtitle}>Enter your registered email and date of birth to access your account.</Text>
+
+                <Text style={styles.fieldLabel}>Registered Email</Text>
+                <TextInput
+                  autoCapitalize="none"
+                  autoComplete="email"
+                  keyboardType="email-address"
+                  placeholder="e.g. prem@gmail.com"
+                  placeholderTextColor={colors.muted}
+                  style={styles.authInput}
+                  value={email}
+                  onChangeText={setEmail}
+                />
+
+                <Text style={styles.fieldLabel}>Date of Birth (YYYY-MM-DD)</Text>
+                <TextInput
+                  autoCapitalize="none"
+                  keyboardType="numbers-and-punctuation"
+                  placeholder="e.g. 1992-09-01"
+                  placeholderTextColor={colors.muted}
+                  style={styles.authInput}
+                  value={dob}
+                  onChangeText={setDob}
+                />
+
+                {!!errorMessage && (
+                  <View style={styles.errorBox}>
+                    <Text style={styles.errorText}>⚠️ {errorMessage}</Text>
+                  </View>
+                )}
+
+                {!!adminNotice && (
+                  <View style={styles.adminNoticeBox}>
+                    <Text style={styles.adminNoticeTitle}>🛡️ Administrator Notice</Text>
+                    <Text style={styles.adminNoticeText}>{adminNotice}</Text>
+                  </View>
+                )}
+
+                <Pressable onPress={() => handleLogin()} disabled={loading} style={styles.signInButton}>
+                  <Text style={styles.signInButtonText}>{loading ? 'Signing In...' : 'Access My Account'}</Text>
+                </Pressable>
+              </>
             )}
-
-            <Pressable
-              onPress={handlePinSubmit}
-              disabled={pinUnlocking || pinInput.length < 4}
-              style={[styles.signInButton, (pinUnlocking || pinInput.length < 4) && { opacity: 0.6 }]}>
-              <Text style={styles.signInButtonText}>{pinUnlocking ? t('common_loading') : t('pin_unlock')}</Text>
-            </Pressable>
-
-            <Pressable onPress={handleUseFullLoginInstead} style={styles.switchAuthModeBtn}>
-              <Text style={styles.switchAuthModeText}>{t('pin_useEmailInstead')}</Text>
-            </Pressable>
 
             <Text style={styles.authFooterBadge}>🔒 Secure 256-bit Encrypted Customer Ledger</Text>
           </View>
