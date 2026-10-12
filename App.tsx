@@ -46,7 +46,17 @@ import * as SecureStore from 'expo-secure-store';
 import * as Speech from 'expo-speech';
 import { detectUpiCredit } from './smsPayments';
 import { isSmsReaderAvailable, readInbox } from './modules/sms-reader';
+import DriverMerchantPanel, { DriverMerchantPanelHandle } from './src/screens/DriverMerchantPanel';
+import { useDutyDistance } from './src/hooks/useDutyDistance';
 import { Language, LANGUAGE_LABELS, TranslationKey, translate } from './i18n';
+
+const INVENTORY_CART_NOTE_PREFIX = '__AUTOLEDGER_CART__:';
+
+// UPI apps the driver can jump to when paying for fuel. Each is tried by its own app link(s).
+const UPI_PAY_APPS = [
+  { name: 'PhonePe', mark: 'Pe', color: '#5F259F', urls: ['phonepe://'] },
+  { name: 'GPay', mark: 'G', color: '#1A73E8', urls: ['tez://', 'gpay://'] },
+];
 
 // Design Tokens for AutoLedger Customer Mobile App
 const colors = {
@@ -287,18 +297,21 @@ type DriverTrip = {
   locationName: string;
   latitude: number | null;
   longitude: number | null;
+  // Set when the trip was recorded automatically from a payment on the driver's merchant QR.
+  qr?: { payerVpa: string; ref: string; transferStatus: string; refundedAmount: number } | null;
 };
 
 type FuelLog = {
   id: string;
   date: string;
   fuelTimeMs: number;
-  fuelType: 'CNG' | 'Petrol' | 'Diesel';
+  fuelType: 'CNG' | 'Petrol' | 'Diesel' | 'Other';
   quantity: number;
   rate: number;
   totalCost: number;
   odometer: number;
   station: string;
+  paymentMode: 'Cash' | 'UPI';
 };
 
 type VehicleDetails = {
@@ -350,6 +363,9 @@ type CollectionRecord = {
 
 const CANDIDATE_API_URLS: string[] = (() => {
   const configured = (process.env.EXPO_PUBLIC_API_URL || '').trim().replace(/\/$/, '');
+  // Installed (release) build: only the real backend. The emulator / LAN addresses below do
+  // not exist on a customer's phone, and each one hung for many seconds before falling through.
+  if (!__DEV__ && configured && !configured.includes('localhost')) return [configured];
   const urls: string[] = [];
 
   if (Platform.OS === 'android') {
@@ -374,22 +390,51 @@ const CANDIDATE_API_URLS: string[] = (() => {
 })();
 
 let activeApiBase = CANDIDATE_API_URLS[0];
+let apiBaseConfirmed = false;
+const LOCAL_PROBE_TIMEOUT_MS = 4000;
+
+function isLocalApiBase(base: string) {
+  return /\/\/(localhost|127\.|10\.|192\.168\.)/.test(base);
+}
+
+// Token issued by /api/login, sent on every request so the backend can tell which
+// account is calling. Kept in memory only - the app logs in afresh on each start.
+let authToken: string | null = null;
+// Called when the backend rejects the token (expired, or issued before a restart).
+let onSessionExpired: (() => void) | null = null;
 
 async function apiFetch(path: string, options?: RequestInit): Promise<Response> {
-  const tryUrl = (base: string) => {
+  const requestOptions: RequestInit | undefined = authToken
+    ? { ...options, headers: { ...(options?.headers as Record<string, string> | undefined), Authorization: `Bearer ${authToken}` } }
+    : options;
+  // While still looking for a reachable backend, a local/dev address gets only a few seconds:
+  // an unreachable one otherwise hangs until the OS gives up. Once an address has answered,
+  // and for the hosted backend (which can take a while to wake), there is no time limit.
+  const tryUrl = async (base: string, probing: boolean) => {
     const fullUrl = `${base}${path.startsWith('/') ? path : `/${path}`}`;
-    return fetch(fullUrl, options);
+    const limited = probing && isLocalApiBase(base) && !requestOptions?.signal;
+    const controller = limited ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), LOCAL_PROBE_TIMEOUT_MS) : null;
+    try {
+      const res = await fetch(fullUrl, controller ? { ...requestOptions, signal: controller.signal } : requestOptions);
+      if (res.status === 401 && path.startsWith('/api/inventory')) onSessionExpired?.();
+      return res;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   };
 
   try {
-    const res = await tryUrl(activeApiBase);
+    const res = await tryUrl(activeApiBase, !apiBaseConfirmed);
+    apiBaseConfirmed = true;
     return res;
   } catch (initialErr) {
     for (const candidate of CANDIDATE_API_URLS) {
       if (candidate === activeApiBase) continue;
       try {
-        const res = await tryUrl(candidate);
+        const res = await tryUrl(candidate, true);
         activeApiBase = candidate;
+        apiBaseConfirmed = true;
         return res;
       } catch {
         // try next candidate
@@ -398,6 +443,10 @@ async function apiFetch(path: string, options?: RequestInit): Promise<Response> 
     throw initialErr;
   }
 }
+
+// The hosted backend sleeps when idle and takes a while to wake. Start waking it as soon as
+// the app opens, so it is ready by the time the user has typed their login.
+apiFetch('/api/health').catch(() => {});
 
 // Initial default transactions for a realistic customer ledger
 const INITIAL_TRANSACTIONS: LedgerTransaction[] = [
@@ -619,12 +668,22 @@ function CustomerAppContent() {
   }
 
   function handleLogout() {
+    authToken = null;
     setUser(null);
     setEmail('');
     setDob('');
     setErrorMessage('');
     setAdminNotice(null);
   }
+
+  // The backend no longer accepts this login (token expired) - back to the login screen.
+  useEffect(() => {
+    onSessionExpired = () => {
+      handleLogout();
+      setErrorMessage('Session expired. Please log in again.');
+    };
+    return () => { onSessionExpired = null; };
+  }, []);
 
   // ---- Session timeout: auto-logout after SESSION_TIMEOUT_MS of either foreground
   // idle (no touch anywhere in the app) or being backgrounded (app switched away /
@@ -856,6 +915,9 @@ function CustomerAppContent() {
   const [driverTripsHistory, setDriverTripsHistory] = useState<{ fare: number; paymentMode: 'Cash' | 'UPI'; tripTimeMs: number; route: string; locationName: string }[]>([]);
   const [selectedEarningsDay, setSelectedEarningsDay] = useState<number | null>(null);
   const [fuelLogs, setFuelLogs] = useState<FuelLog[]>([]);
+  // Every fuel entry (not just today's) for the Fuel Log list; the tiles above it stay on today's fuelLogs.
+  const [fuelLogsAll, setFuelLogsAll] = useState<FuelLog[]>([]);
+  const [showAllFuelHistory, setShowAllFuelHistory] = useState(false);
   const [driverFuelHistory, setDriverFuelHistory] = useState<{ totalCost: number; fuelTimeMs: number }[]>([]);
   const [selectedFuelDay, setSelectedFuelDay] = useState<number | null>(null);
   const [routeSafetyAdvisory, setRouteSafetyAdvisory] = useState<{ severity: 'moderate' | 'high'; message: string } | null>(null);
@@ -879,6 +941,24 @@ function CustomerAppContent() {
   const [selectedReportPeakBucket, setSelectedReportPeakBucket] = useState<number | null>(null);
   const [reportExporting, setReportExporting] = useState(false);
   const [inventory, setInventory] = useState<InventoryItem[]>(INITIAL_INVENTORY);
+  const [inventorySearchQuery, setInventorySearchQuery] = useState('');
+  const [selectedInventoryIds, setSelectedInventoryIds] = useState<string[]>([]);
+  const [cartQuantities, setCartQuantities] = useState<Record<string, string>>({});
+  const [showInventoryCartModal, setShowInventoryCartModal] = useState(false);
+  const [cartPaymentMethod, setCartPaymentMethod] = useState<'CASH' | 'UPI' | 'CREDIT'>('CASH');
+  const [cartCreditCustomerName, setCartCreditCustomerName] = useState('');
+  const [showCartCustomerPicker, setShowCartCustomerPicker] = useState(false);
+  const [cartCheckoutLoading, setCartCheckoutLoading] = useState(false);
+  const [expandedInventoryCartId, setExpandedInventoryCartId] = useState<string | null>(null);
+  const [deleteSelectedLoading, setDeleteSelectedLoading] = useState(false);
+  const [showSelectedPurchaseModal, setShowSelectedPurchaseModal] = useState(false);
+  const [selectedPurchaseQuantities, setSelectedPurchaseQuantities] = useState<Record<string, string>>({});
+  const [selectedPurchaseAmounts, setSelectedPurchaseAmounts] = useState<Record<string, string>>({});
+  const [selectedPurchasePaid, setSelectedPurchasePaid] = useState<Record<string, boolean>>({});
+  const [selectedPurchaseVendors, setSelectedPurchaseVendors] = useState<Record<string, string>>({});
+  const [selectedPurchaseVendorSearches, setSelectedPurchaseVendorSearches] = useState<Record<string, string>>({});
+  const [selectedPurchaseVendorPickerId, setSelectedPurchaseVendorPickerId] = useState<string | null>(null);
+  const [selectedPurchaseSaving, setSelectedPurchaseSaving] = useState(false);
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [inventoryTransactions, setInventoryTransactions] = useState<any[]>([]);
   const [inventorySummary, setInventorySummary] = useState<any>(null);
@@ -887,6 +967,7 @@ function CustomerAppContent() {
   const [dcCalendarMonth, setDcCalendarMonth] = useState(new Date());
   const [showPurchaseDetailModal, setShowPurchaseDetailModal] = useState(false);
   const [vendors, setVendors] = useState<any[]>([]);
+  const [selectedVendorNames, setSelectedVendorNames] = useState<string[]>([]);
   const [vendorsLoading, setVendorsLoading] = useState(false);
   const [showVendorPicker, setShowVendorPicker] = useState(false);
   const [showAddVendorModal, setShowAddVendorModal] = useState(false);
@@ -903,7 +984,60 @@ function CustomerAppContent() {
   const [payVendorAmount, setPayVendorAmount] = useState('');
   const [payVendorMethod, setPayVendorMethod] = useState<'CASH' | 'UPI' | 'CREDIT'>('CASH');
   const [payVendorNote, setPayVendorNote] = useState('');
+  const [payVendorEntryId, setPayVendorEntryId] = useState<string | null>(null);
   const [payVendorLoading, setPayVendorLoading] = useState(false);
+
+  // ---- Customer Credit Book (Udhaar): receivables mirror of the Vendor system above ----
+  const [customers, setCustomers] = useState<any[]>([]);
+  const [selectedCustomerNames, setSelectedCustomerNames] = useState<string[]>([]);
+  const [customersLoading, setCustomersLoading] = useState(false);
+  const [showCustomerPicker, setShowCustomerPicker] = useState(false);
+  const [showAddCustomerModal, setShowAddCustomerModal] = useState(false);
+  const [newCustomerName, setNewCustomerName] = useState('');
+  const [newCustomerMobile, setNewCustomerMobile] = useState('');
+  const [newCustomerEmail, setNewCustomerEmail] = useState('');
+  const [newCustomerAddress, setNewCustomerAddress] = useState('');
+  const [addCustomerLoading, setAddCustomerLoading] = useState(false);
+  const [showCustomerLedgerModal, setShowCustomerLedgerModal] = useState(false);
+  const [customerLedgerName, setCustomerLedgerName] = useState('');
+  const [customerLedger, setCustomerLedger] = useState<any>(null);
+  const [customerLedgerLoading, setCustomerLedgerLoading] = useState(false);
+  const [showPayCustomerModal, setShowPayCustomerModal] = useState(false);
+  const [payCustomerAmount, setPayCustomerAmount] = useState('');
+  const [payCustomerMethod, setPayCustomerMethod] = useState<'CASH' | 'UPI' | 'CREDIT'>('CASH');
+  const [payCustomerNote, setPayCustomerNote] = useState('');
+  const [payCustomerEntryId, setPayCustomerEntryId] = useState<string | null>(null);
+  const [editTx, setEditTx] = useState<any>(null);
+  const [editTxQuantity, setEditTxQuantity] = useState('');
+  const [editTxAmount, setEditTxAmount] = useState('');
+  const [editTxPaid, setEditTxPaid] = useState('');
+  const [editTxDate, setEditTxDate] = useState('');
+  const [editTxSaving, setEditTxSaving] = useState(false);
+  const [editParty, setEditParty] = useState<{ side: 'vendor' | 'customer'; originalName: string } | null>(null);
+  const [editPartyName, setEditPartyName] = useState('');
+  const [editPartyMobile, setEditPartyMobile] = useState('');
+  const [editPartyEmail, setEditPartyEmail] = useState('');
+  const [editPartyAddress, setEditPartyAddress] = useState('');
+  const [editPartySaving, setEditPartySaving] = useState(false);
+  const [statementExporting, setStatementExporting] = useState(false);
+  const [profitPeriod, setProfitPeriod] = useState<'weekly' | 'monthly'>('weekly');
+  const [periodReport, setPeriodReport] = useState<any>(null);
+  const [payCustomerLoading, setPayCustomerLoading] = useState(false);
+
+  // ---- Daily Expenses (rent, transport, labor - not tied to a product) ----
+  const [expenses, setExpenses] = useState<any[]>([]);
+  const [expensesLoading, setExpensesLoading] = useState(false);
+  const [showAddExpenseModal, setShowAddExpenseModal] = useState(false);
+  const [newExpenseCategory, setNewExpenseCategory] = useState('');
+  const [newExpenseAmount, setNewExpenseAmount] = useState('');
+  const [newExpensePaymentMethod, setNewExpensePaymentMethod] = useState<'CASH' | 'UPI' | 'CREDIT'>('CASH');
+  const [newExpenseNote, setNewExpenseNote] = useState('');
+  const [addExpenseLoading, setAddExpenseLoading] = useState(false);
+
+  // ---- Price Trend per product (selling price over recent sales) ----
+  const [showPriceTrendModal, setShowPriceTrendModal] = useState(false);
+  const [priceTrend, setPriceTrend] = useState<any>(null);
+  const [priceTrendLoading, setPriceTrendLoading] = useState(false);
 
   const [showAddProductModal, setShowAddProductModal] = useState(false);
   const [newProductName, setNewProductName] = useState('');
@@ -912,6 +1046,8 @@ function CustomerAppContent() {
   const [newProductStockQty, setNewProductStockQty] = useState('');
   const [newProductSellingPrice, setNewProductSellingPrice] = useState('');
   const [newProductCostPrice, setNewProductCostPrice] = useState('');
+  // Set while the Add Product form is being used to edit an existing product.
+  const [editingProductId, setEditingProductId] = useState<string | null>(null);
   const [newProductLowStock, setNewProductLowStock] = useState('');
   const [addProductLoading, setAddProductLoading] = useState(false);
 
@@ -925,7 +1061,7 @@ function CustomerAppContent() {
   const [salePaymentMethod, setSalePaymentMethod] = useState<'CASH' | 'UPI' | 'CREDIT'>('CASH');
   const [recordSaleLoading, setRecordSaleLoading] = useState(false);
   const [salePaidNow, setSalePaidNow] = useState('');
-  const [inventoryVoiceProcessing, setInventoryVoiceProcessing] = useState(false);
+  const [inventorySearchVoiceProcessing, setInventorySearchVoiceProcessing] = useState(false);
   const [inventoryVoiceTranscript, setInventoryVoiceTranscript] = useState('');
   const [inventoryVoiceConfirmed, setInventoryVoiceConfirmed] = useState(false);
 
@@ -934,7 +1070,18 @@ function CustomerAppContent() {
   const [editStockAddQty, setEditStockAddQty] = useState('');
   const [editStockLoading, setEditStockLoading] = useState(false);
   const [inventoryInsights, setInventoryInsights] = useState<any>(null);
+  const [homeSnapshot, setHomeSnapshot] = useState<{ today: any; yesterdayProfit: number } | null>(null);
   const [restockSuggestions, setRestockSuggestions] = useState<any[]>([]);
+  const [pricingAdvisor, setPricingAdvisor] = useState<any>(null);
+  const [pricingMinMargin, setPricingMinMargin] = useState('15');
+  const [pricingTargetMargin, setPricingTargetMargin] = useState('30');
+  const [pricingExpandedId, setPricingExpandedId] = useState<string | null>(null);
+  const [pricingDiscountPct, setPricingDiscountPct] = useState(10);
+  const [pricingApplyingId, setPricingApplyingId] = useState<string | null>(null);
+  const [dailyRates, setDailyRates] = useState<any[] | null>(null);
+  const [showDailyRatesModal, setShowDailyRatesModal] = useState(false);
+  const [dailyRateInputs, setDailyRateInputs] = useState<Record<string, string>>({});
+  const [dailyRatesSaving, setDailyRatesSaving] = useState(false);
 
   // Building Maintenance (Phase 1: Building / Floors / Flats / Members)
   const [myBuilding, setMyBuilding] = useState<any>(null);
@@ -1105,8 +1252,31 @@ function CustomerAppContent() {
   // Auto Driver: own UPI QR code
   const [driverQr, setDriverQr] = useState<string | null>(null);
   const [showQrModal, setShowQrModal] = useState(false);
+  // Razorpay-generated QR of the driver's merchant account; shown in place of an uploaded image.
+  const [merchantQrUrl, setMerchantQrUrl] = useState<string | null>(null);
+  const shownDriverQr = merchantQrUrl || driverQr;
+  const [merchantCanUpdateKeys, setMerchantCanUpdateKeys] = useState(false);
+  const [merchantTestMode, setMerchantTestMode] = useState(false);
+  // Speaks each new QR payment aloud ("50 rupees received"), like a soundbox
+  const [paySoundOn, setPaySoundOn] = useState(true);
+  const announcedQrTrips = useRef<Set<string> | null>(null);
+  // Read through a ref: the payment poller keeps calling an older loadDriverTrips closure.
+  const paySoundOnRef = useRef(true);
+  paySoundOnRef.current = paySoundOn;
+  const [showDaySummary, setShowDaySummary] = useState(false);
+  const [showKeysTip, setShowKeysTip] = useState(false);
+  const merchantPanelRef = React.useRef<DriverMerchantPanelHandle>(null);
   const [qrSaving, setQrSaving] = useState(false);
   const [showQuickPaymentModal, setShowQuickPaymentModal] = useState(false);
+  // Quick fuel expense: amount + how it was paid, nothing else
+  const [showQuickFuelModal, setShowQuickFuelModal] = useState(false);
+  const [quickFuelAmount, setQuickFuelAmount] = useState('');
+  const [quickFuelMode, setQuickFuelMode] = useState<'Cash' | 'UPI'>('Cash');
+  const [quickFuelType, setQuickFuelType] = useState<'CNG' | 'Petrol' | 'Other'>('CNG');
+  const [quickFuelSaving, setQuickFuelSaving] = useState(false);
+  // Set while the driver is away in a UPI app paying the pump; on his return he confirms and the fuel is saved.
+  const [fuelPayApp, setFuelPayApp] = useState<string | null>(null);
+  const fuelPayLeftApp = useRef(false);
   const [quickPaymentMode, setQuickPaymentMode] = useState<'Cash' | 'UPI'>('Cash');
   const [quickPaymentAmount, setQuickPaymentAmount] = useState('');
   const [quickPaymentSaving, setQuickPaymentSaving] = useState(false);
@@ -1253,7 +1423,31 @@ function CustomerAppContent() {
       const res = await apiFetch(`/api/inventory/transactions?owner_id=${user.id}&period=daily&date=${dateISO}`);
       if (res.ok) {
         const data = await res.json();
-        setInventoryTransactions(data.transactions || []);
+        const loadedTransactions = data.transactions || [];
+        const vendorNames = [...new Set<string>(
+          loadedTransactions
+            .filter((tx: any) => tx.type === 'PURCHASE' && tx.amountDue > 0 && tx.note)
+            .map((tx: any) => String(tx.note).trim())
+            .filter((vendorName: string) => vendorName.length > 0),
+        )];
+        const vendorPurchaseDues = new Map<string, number>();
+        await Promise.all(vendorNames.map(async vendorName => {
+          try {
+            const ledgerRes = await apiFetch(`/api/inventory/vendor-ledger?owner_id=${user.id}&vendor=${encodeURIComponent(vendorName)}`);
+            if (!ledgerRes.ok) return;
+            const ledger = await ledgerRes.json();
+            for (const purchase of ledger.purchases || []) {
+              vendorPurchaseDues.set(String(purchase.id), Number(purchase.amountDue) || 0);
+            }
+          } catch (e) {
+            console.error('Error reconciling purchase due from vendor ledger:', e);
+          }
+        }));
+        setInventoryTransactions(loadedTransactions.map((tx: any) => (
+          tx.type === 'PURCHASE' && vendorPurchaseDues.has(String(tx.id))
+            ? { ...tx, amountDue: vendorPurchaseDues.get(String(tx.id)) }
+            : tx
+        )));
         setInventorySummary(data.summary || null);
       }
     } catch (e) {
@@ -1281,6 +1475,64 @@ function CustomerAppContent() {
     }
   }
 
+  // Home screen figures that must always be about today (and yesterday, for
+  // comparison), regardless of which date Daily Collection is showing.
+  async function loadHomeSnapshot() {
+    if (!user?.id) return;
+    try {
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const [todayRes, yesterdayRes] = await Promise.all(
+        [new Date(), yesterday].map(d =>
+          apiFetch(`/api/inventory/transactions?owner_id=${user.id}&period=daily&date=${formatDateISO(d)}`)),
+      );
+      if (todayRes.ok && yesterdayRes.ok) {
+        const [todayData, yesterdayData] = await Promise.all([todayRes.json(), yesterdayRes.json()]);
+        setHomeSnapshot({ today: todayData.summary || null, yesterdayProfit: yesterdayData.summary?.netProfit || 0 });
+      }
+    } catch (e) {
+      console.error('Error loading home snapshot:', e);
+    }
+  }
+
+  // Insights "Profit Report": the same summary Daily Collection shows for one day,
+  // totalled over the current week or month.
+  async function loadPeriodReport(period: 'weekly' | 'monthly') {
+    if (!user?.id) return;
+    try {
+      const res = await apiFetch(`/api/inventory/transactions?owner_id=${user.id}&period=${period}&date=${formatDateISO(new Date())}`);
+      if (res.ok) {
+        const data = await res.json();
+        setPeriodReport({ period, startDate: data.startDate, endDate: data.endDate, summary: data.summary || {} });
+      }
+    } catch (e) {
+      console.error('Error loading period report:', e);
+    }
+  }
+
+  useEffect(() => {
+    if (user && activeTab === 'inventory_insights') loadPeriodReport(profitPeriod);
+  }, [user?.id, activeTab, profitPeriod]);
+
+  function handleSharePeriodReport() {
+    if (!periodReport) return;
+    const sm = periodReport.summary;
+    const money = (v: number) => `₹${(v || 0).toLocaleString()}`;
+    const lines = [
+      `*${t('ins_reportTitle')}* — ${user?.fullName || ''}`,
+      `${periodReport.startDate} → ${periodReport.endDate}`,
+      '',
+      `${t('ins_reportSales')}: ${money(sm.totalAmount)}`,
+      `${t('ins_costOfGoods')}: ${money(sm.costOfGoodsSold)}`,
+      `${t('dc_wastageLabel')}: ${money(sm.wastageValue)}`,
+      `${t('dc_expenses')}: ${money(sm.expenseValue)}`,
+      `*${t('dc_netProfit')}: ${money(sm.netProfit)}*`,
+      '',
+      `${t('dc_purchases')}: ${money(sm.purchaseValue)}`,
+    ];
+    Share.share({ message: lines.join('\n') }).catch(() => {});
+  }
+
   async function loadRestockSuggestions() {
     if (!user?.id) return;
     try {
@@ -1292,6 +1544,132 @@ function CustomerAppContent() {
     } catch (e) {
       console.error('Error loading restock suggestions:', e);
     }
+  }
+
+  async function loadPricingAdvisor() {
+    if (!user?.id) return;
+    try {
+      const res = await apiFetch(`/api/inventory/pricing-advisor?owner_id=${user.id}`);
+      if (res.ok) {
+        setPricingAdvisor(await res.json());
+      }
+    } catch (e) {
+      console.error('Error loading pricing advisor:', e);
+    }
+  }
+
+  async function loadDailyRates() {
+    if (!user?.id) return;
+    try {
+      const res = await apiFetch(`/api/inventory/daily-rates?owner_id=${user.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setDailyRates(data.rates || []);
+      }
+    } catch (e) {
+      console.error('Error loading daily rates:', e);
+    }
+  }
+
+  function handleOpenDailyRates() {
+    setDailyRateInputs(Object.fromEntries((dailyRates || []).map(rate => [rate.productId, rate.sellingPrice > 0 ? String(rate.sellingPrice) : ''])));
+    setShowDailyRatesModal(true);
+  }
+
+  async function handleSaveDailyRates() {
+    if (!user?.id || dailyRatesSaving || !dailyRates?.length) return;
+    const rates = dailyRates.map(rate => ({ productId: rate.productId, name: rate.productName, sellingPrice: Number(dailyRateInputs[rate.productId]) }));
+    const invalid = rates.find(rate => !Number.isFinite(rate.sellingPrice) || rate.sellingPrice <= 0);
+    if (invalid) {
+      Alert.alert(t('common_missingField'), t('rate_invalid', { name: invalid.name }));
+      return;
+    }
+    setDailyRatesSaving(true);
+    try {
+      const res = await apiFetch('/api/inventory/daily-rates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerId: user.id, rates: rates.map(({ productId, sellingPrice }) => ({ productId, sellingPrice })) }),
+      });
+      if (res.ok) {
+        await Promise.all([loadDailyRates(), loadInventoryProducts()]);
+        setShowDailyRatesModal(false);
+        Alert.alert(t('common_success'), t('rate_saved'));
+      } else {
+        const data = await res.json().catch(() => ({}));
+        Alert.alert(t('common_error'), data.error || t('rate_saveFailed'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setDailyRatesSaving(false);
+    }
+  }
+
+  function handleShareDailyRates() {
+    const lines = [
+      `*${t('rate_title')}* — ${user?.fullName || ''}`,
+      formatDisplayDate(formatDateISO(new Date())),
+      '',
+      ...(dailyRates || [])
+        .filter(rate => Number(dailyRateInputs[rate.productId]) > 0)
+        .map(rate => `${rate.productName}: ₹${Number(dailyRateInputs[rate.productId])}/${rate.unit}`),
+    ];
+    Share.share({ message: lines.join('\n') }).catch(() => {});
+  }
+
+  // The seller's own minimum / target profit % (on cost), kept on the device.
+  useEffect(() => {
+    if (!user?.id) return;
+    AsyncStorage.getItem(`pricingMargins_${user.id}`).then(saved => {
+      const [min, target] = (saved || '').split(',');
+      if (min) setPricingMinMargin(min);
+      if (target) setPricingTargetMargin(target);
+    }).catch(() => {});
+  }, [user?.id]);
+
+  function updatePricingMargin(kind: 'min' | 'target', value: string) {
+    const clean = value.replace(/[^0-9.]/g, '');
+    const min = kind === 'min' ? clean : pricingMinMargin;
+    const target = kind === 'target' ? clean : pricingTargetMargin;
+    setPricingMinMargin(min);
+    setPricingTargetMargin(target);
+    if (user?.id) AsyncStorage.setItem(`pricingMargins_${user.id}`, `${min},${target}`).catch(() => {});
+  }
+
+  function handleApplySuggestedPrice(product: any, newPrice: number) {
+    if (!user?.id || pricingApplyingId) return;
+    Alert.alert(
+      t('price_suggested'),
+      t('price_setPriceConfirm', { name: product.productName, from: product.sellingPrice, to: newPrice, unit: product.unit }),
+      [
+        { text: t('common_cancel'), style: 'cancel' },
+        {
+          text: t('common_ok'),
+          onPress: async () => {
+            setPricingApplyingId(product.productId);
+            try {
+              const res = await apiFetch(`/api/inventory/products/${product.productId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ownerId: user.id, sellingPrice: newPrice }),
+              });
+              if (res.ok) {
+                await Promise.all([loadPricingAdvisor(), loadInventoryProducts()]);
+                Alert.alert(t('price_priceUpdated'), `${product.productName}: ₹${newPrice}/${product.unit}`);
+              } else {
+                const data = await res.json().catch(() => ({}));
+                Alert.alert(t('common_error'), data.error || t('price_priceUpdateFailed'));
+              }
+            } catch {
+              Alert.alert(t('common_error'), t('common_networkError'));
+            } finally {
+              setPricingApplyingId(null);
+            }
+          },
+        },
+      ],
+    );
   }
 
   // --- Building Maintenance (Phase 1) ---
@@ -2381,18 +2759,35 @@ function CustomerAppContent() {
     }
     if (user && activeTab === 'inventory_insights') {
       loadInventoryInsights();
+      loadPricingAdvisor();
+    }
+    if (user && activeTab === 'home' && (hasFeature('inventory') || hasFeature('products'))) {
+      loadHomeSnapshot();
+      loadInventoryInsights();
+      loadVendors();
+      loadCustomers();
     }
     if (user && activeTab === 'inventory') {
       loadRestockSuggestions();
+      loadDailyRates();
     }
     if (user && (activeTab === 'vendors' || activeTab === 'daily_collection')) {
       loadVendors();
+    }
+    if (user && (activeTab === 'customers' || activeTab === 'daily_collection')) {
+      loadCustomers();
+    }
+    if (user && activeTab === 'daily_collection') {
+      loadExpenses();
     }
   }, [user?.id, activeTab]);
 
   useEffect(() => {
     if (user && (activeTab === 'inventory' || activeTab === 'daily_collection' || activeTab === 'sales')) {
       loadInventoryTransactions(dcSelectedDate);
+    }
+    if (user && activeTab === 'daily_collection') {
+      loadExpenses();
     }
   }, [dcSelectedDate]);
 
@@ -2460,6 +2855,87 @@ function CustomerAppContent() {
     }
   }
 
+  function toggleVendorSelection(vendorName: string) {
+    setSelectedVendorNames(previous => previous.includes(vendorName)
+      ? previous.filter(name => name !== vendorName)
+      : [...previous, vendorName]);
+  }
+
+  function handleToggleAllVendors() {
+    setSelectedVendorNames(selectedVendorNames.length === vendors.length ? [] : vendors.map(vendor => vendor.vendorName));
+  }
+
+  function handleEditSelectedVendor() {
+    if (selectedVendorNames.length !== 1) return;
+    const vendor = vendors.find(item => item.vendorName === selectedVendorNames[0]);
+    if (!vendor) return;
+    setEditPartyName(vendor.vendorName);
+    setEditPartyMobile(vendor.mobileNumber || '');
+    setEditPartyEmail(vendor.email || '');
+    setEditPartyAddress(vendor.address || '');
+    setEditParty({ side: 'vendor', originalName: vendor.vendorName });
+  }
+
+  function handleDeleteSelectedVendors() {
+    if (!user?.id || selectedVendorNames.length === 0) return;
+    const names = [...selectedVendorNames];
+    Alert.alert(
+      t('dc_deleteVendorTitle'),
+      t('dc_deleteSelectedVendorsConfirm', { count: names.length }),
+      [
+        { text: t('common_cancel'), style: 'cancel' },
+        {
+          text: t('common_delete'),
+          style: 'destructive',
+          onPress: async () => {
+            const deletedNames: string[] = [];
+            let failedCount = 0;
+            for (const name of names) {
+              try {
+                const res = await apiFetch(`/api/inventory/vendors?owner_id=${user.id}&vendor=${encodeURIComponent(name)}`, { method: 'DELETE' });
+                if (res.ok) deletedNames.push(name);
+                else failedCount += 1;
+              } catch {
+                failedCount += 1;
+              }
+            }
+            setSelectedVendorNames(previous => previous.filter(name => !deletedNames.includes(name)));
+            await loadVendors();
+            if (failedCount > 0) Alert.alert(t('common_error'), t('dc_deleteSelectedVendorsFailed', { count: failedCount }));
+          },
+        },
+      ],
+    );
+  }
+
+  function handleDeleteInventoryVendor(vendorName: string) {
+    if (!user?.id) return;
+    Alert.alert(
+      t('dc_deleteVendorTitle'),
+      t('dc_deleteVendorConfirm', { vendor: vendorName }),
+      [
+        { text: t('common_cancel'), style: 'cancel' },
+        {
+          text: t('common_delete'),
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const res = await apiFetch(`/api/inventory/vendors?owner_id=${user.id}&vendor=${encodeURIComponent(vendorName)}`, { method: 'DELETE' });
+              if (res.ok) {
+                loadVendors();
+              } else {
+                const data = await res.json();
+                Alert.alert(t('common_error'), data.error || t('dc_deleteVendorFailed'));
+              }
+            } catch {
+              Alert.alert(t('common_error'), t('common_networkError'));
+            }
+          },
+        },
+      ]
+    );
+  }
+
   async function loadVendorLedger(vendorName: string) {
     if (!user?.id || !vendorName) return;
     setVendorLedgerLoading(true);
@@ -2484,12 +2960,41 @@ function CustomerAppContent() {
     loadVendorLedger(vendorName);
   }
 
-  function handleOpenPayVendor() {
+  function handleOpenPayVendor(presetAmount?: number, presetNote?: string, entryId?: string) {
     const due = vendorLedger?.totals?.totalDue || 0;
-    setPayVendorAmount(due > 0 ? String(due) : '');
+    const amount = presetAmount != null ? presetAmount : due;
+    setPayVendorAmount(amount > 0 ? String(amount) : '');
     setPayVendorMethod('CASH');
-    setPayVendorNote('');
+    setPayVendorNote(presetNote || '');
+    setPayVendorEntryId(entryId || null);
     setShowPayVendorModal(true);
+  }
+
+  // Opens WhatsApp with a polite, pre-filled note to the vendor whose ledger is
+  // open, confirming how much the owner still has to pay them.
+  function handleSendVendorDueMessage() {
+    const due = vendorLedger?.totals?.totalDue || 0;
+    if (due <= 0) return;
+    if (!normalizeIndianMobile(vendorLedger?.mobileNumber || '')) {
+      Alert.alert(t('common_error'), t('dc_vendorDueNoMobile'));
+      return;
+    }
+    const pending = (vendorLedger.purchases || []).filter((p: any) => p.amountDue > 0).reverse();
+    const lines = [
+      t('dc_remindGreeting', { customer: vendorLedgerName }),
+      '',
+      t('dc_vendorDueBody', { amount: due.toLocaleString() }),
+      '',
+      ...pending.map((p: any) => `• ${p.productName} (${p.quantity} ${p.unit}), ${p.date}: ₹${p.amountDue.toLocaleString()}`),
+      ...(pending.length > 0 ? [''] : []),
+      t('dc_vendorDueClosing'),
+      '',
+      t('dc_vendorDueThanks'),
+      '',
+      t('dc_remindRegards'),
+      user?.fullName || '',
+    ];
+    sendBookingWhatsApp(vendorLedger.mobileNumber, lines.join('\n'));
   }
 
   async function handleRecordVendorPayment() {
@@ -2510,13 +3015,17 @@ function CustomerAppContent() {
           amount,
           paymentMethod: payVendorMethod,
           note: payVendorNote.trim(),
+          transactionId: payVendorEntryId,
         }),
       });
       const data = await res.json();
       if (res.ok) {
         setShowPayVendorModal(false);
-        await loadVendorLedger(vendorLedgerName);
-        if (activeTab === 'vendors') loadVendors();
+        await Promise.all([
+          loadVendorLedger(vendorLedgerName),
+          loadInventoryTransactions(dcSelectedDate),
+          ...(activeTab === 'vendors' ? [loadVendors()] : []),
+        ]);
         Alert.alert(t('dc_paymentRecorded'), t('dc_paymentRecordedMsg', { amount, vendor: vendorLedgerName }));
       } else {
         Alert.alert(t('common_error'), data.error || t('dc_recordFailed'));
@@ -2525,6 +3034,369 @@ function CustomerAppContent() {
       Alert.alert(t('common_error'), t('common_networkError'));
     } finally {
       setPayVendorLoading(false);
+    }
+  }
+
+  function handleOpenAddInventoryCustomer() {
+    setNewCustomerName('');
+    setNewCustomerMobile('');
+    setNewCustomerEmail('');
+    setNewCustomerAddress('');
+    setShowAddCustomerModal(true);
+  }
+
+  async function handleAddCustomer() {
+    if (!newCustomerName.trim()) {
+      Alert.alert(t('common_missingField'), t('dc_missingCustomerName'));
+      return;
+    }
+    if (!user?.id) {
+      Alert.alert(t('common_error'), t('inv_accountError'));
+      return;
+    }
+    setAddCustomerLoading(true);
+    try {
+      const res = await apiFetch('/api/inventory/customers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ownerId: user.id,
+          name: newCustomerName.trim(),
+          mobileNumber: newCustomerMobile.trim(),
+          email: newCustomerEmail.trim(),
+          address: newCustomerAddress.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setShowAddCustomerModal(false);
+        await loadCustomers();
+      } else {
+        Alert.alert(t('common_error'), data.error || t('dc_recordFailed'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setAddCustomerLoading(false);
+    }
+  }
+
+  async function loadCustomers() {
+    if (!user?.id) return;
+    setCustomersLoading(true);
+    try {
+      const res = await apiFetch(`/api/inventory/customers?owner_id=${user.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setCustomers(data.customers || []);
+      }
+    } catch (e) {
+      console.error('Error loading customers:', e);
+    } finally {
+      setCustomersLoading(false);
+    }
+  }
+
+  function handleDeleteInventoryCustomer(customerName: string) {
+    if (!user?.id) return;
+    Alert.alert(
+      t('dc_deleteCustomerTitle'),
+      t('dc_deleteCustomerConfirm', { customer: customerName }),
+      [
+        { text: t('common_cancel'), style: 'cancel' },
+        {
+          text: t('common_delete'),
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const res = await apiFetch(`/api/inventory/customers?owner_id=${user.id}&customer=${encodeURIComponent(customerName)}`, { method: 'DELETE' });
+              if (res.ok) {
+                loadCustomers();
+              } else {
+                const data = await res.json();
+                Alert.alert(t('common_error'), data.error || t('dc_deleteCustomerFailed'));
+              }
+            } catch {
+              Alert.alert(t('common_error'), t('common_networkError'));
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  function toggleCustomerSelection(customerName: string) {
+    setSelectedCustomerNames(previous => previous.includes(customerName)
+      ? previous.filter(name => name !== customerName)
+      : [...previous, customerName]);
+  }
+
+  function handleToggleAllCustomers() {
+    setSelectedCustomerNames(selectedCustomerNames.length === customers.length ? [] : customers.map(customer => customer.customerName));
+  }
+
+  function handleEditSelectedCustomer() {
+    if (selectedCustomerNames.length !== 1) return;
+    const customer = customers.find(item => item.customerName === selectedCustomerNames[0]);
+    if (!customer) return;
+    setEditPartyName(customer.customerName);
+    setEditPartyMobile(customer.mobileNumber || '');
+    setEditPartyEmail(customer.email || '');
+    setEditPartyAddress(customer.address || '');
+    setEditParty({ side: 'customer', originalName: customer.customerName });
+  }
+
+  function handleDeleteSelectedCustomers() {
+    if (!user?.id || selectedCustomerNames.length === 0) return;
+    const names = [...selectedCustomerNames];
+    Alert.alert(
+      t('dc_deleteCustomerTitle'),
+      t('dc_deleteSelectedCustomersConfirm', { count: names.length }),
+      [
+        { text: t('common_cancel'), style: 'cancel' },
+        {
+          text: t('common_delete'),
+          style: 'destructive',
+          onPress: async () => {
+            const deletedNames: string[] = [];
+            let failedCount = 0;
+            for (const name of names) {
+              try {
+                const res = await apiFetch(`/api/inventory/customers?owner_id=${user.id}&customer=${encodeURIComponent(name)}`, { method: 'DELETE' });
+                if (res.ok) deletedNames.push(name);
+                else failedCount += 1;
+              } catch {
+                failedCount += 1;
+              }
+            }
+            setSelectedCustomerNames(previous => previous.filter(name => !deletedNames.includes(name)));
+            await loadCustomers();
+            if (failedCount > 0) Alert.alert(t('common_error'), t('dc_deleteSelectedCustomersFailed', { count: failedCount }));
+          },
+        },
+      ],
+    );
+  }
+
+  async function loadCustomerLedger(customerName: string) {
+    if (!user?.id || !customerName) return;
+    setCustomerLedgerLoading(true);
+    try {
+      const res = await apiFetch(`/api/inventory/customer-ledger?owner_id=${user.id}&customer=${encodeURIComponent(customerName)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setCustomerLedger(data);
+      }
+    } catch (e) {
+      console.error('Error loading customer ledger:', e);
+    } finally {
+      setCustomerLedgerLoading(false);
+    }
+  }
+
+  function handleOpenCustomerLedger(customerName: string) {
+    if (!customerName) return;
+    setCustomerLedgerName(customerName);
+    setCustomerLedger(null);
+    setShowCustomerLedgerModal(true);
+    loadCustomerLedger(customerName);
+  }
+
+  function handleOpenPayCustomer(presetAmount?: number, presetNote?: string, entryId?: string) {
+    const due = customerLedger?.totals?.totalDue || 0;
+    const amount = presetAmount != null ? presetAmount : due;
+    setPayCustomerAmount(amount > 0 ? String(amount) : '');
+    setPayCustomerMethod('CASH');
+    setPayCustomerNote(presetNote || '');
+    setPayCustomerEntryId(entryId || null);
+    setShowPayCustomerModal(true);
+  }
+
+  // Opens WhatsApp with a polite, pre-filled pending-payment reminder for the
+  // customer whose ledger is open - the owner just has to hit send.
+  function handleSendCustomerReminder() {
+    sendCustomerReminder(customerLedgerName, customerLedger);
+  }
+
+  // Same reminder, straight from the Home screen's pending list - fetches that
+  // customer's ledger first so the message can list the unpaid entries.
+  async function handleRemindCustomerFromHome(customerName: string) {
+    if (!user?.id) return;
+    try {
+      const res = await apiFetch(`/api/inventory/customer-ledger?owner_id=${user.id}&customer=${encodeURIComponent(customerName)}`);
+      if (res.ok) {
+        sendCustomerReminder(customerName, await res.json());
+      } else {
+        Alert.alert(t('common_error'), t('common_networkError'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    }
+  }
+
+  function sendCustomerReminder(customerName: string, ledger: any) {
+    const due = ledger?.totals?.totalDue || 0;
+    if (due <= 0) return;
+    if (!normalizeIndianMobile(ledger?.mobileNumber || '')) {
+      Alert.alert(t('common_error'), t('dc_remindNoMobile'));
+      return;
+    }
+    const pending = (ledger.sales || []).filter((s: any) => s.amountDue > 0).reverse();
+    const lines = [
+      t('dc_remindGreeting', { customer: customerName }),
+      '',
+      t('dc_remindBody', { amount: due.toLocaleString() }),
+      '',
+      ...pending.map((s: any) => `• ${s.productName} (${s.quantity} ${s.unit}), ${s.date}: ₹${s.amountDue.toLocaleString()}`),
+      ...(pending.length > 0 ? [''] : []),
+      t('dc_remindClosing'),
+      '',
+      t('dc_remindThanks'),
+      '',
+      t('dc_remindRegards'),
+      user?.fullName || '',
+    ];
+    sendBookingWhatsApp(ledger.mobileNumber, lines.join('\n'));
+  }
+
+  async function handleRecordCustomerPayment() {
+    const amount = parseFloat(payCustomerAmount) || 0;
+    if (amount <= 0) {
+      Alert.alert(t('common_missingField'), t('dc_missingPayAmount'));
+      return;
+    }
+    if (!user?.id || !customerLedgerName) return;
+    setPayCustomerLoading(true);
+    try {
+      const res = await apiFetch('/api/inventory/customer-payments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ownerId: user.id,
+          customerName: customerLedgerName,
+          amount,
+          paymentMethod: payCustomerMethod,
+          note: payCustomerNote.trim(),
+          transactionId: payCustomerEntryId,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setShowPayCustomerModal(false);
+        await loadCustomerLedger(customerLedgerName);
+        if (activeTab === 'customers') loadCustomers();
+        Alert.alert(t('dc_paymentRecorded'), t('dc_customerPaymentRecordedMsg', { amount, customer: customerLedgerName }));
+      } else {
+        Alert.alert(t('common_error'), data.error || t('dc_recordFailed'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setPayCustomerLoading(false);
+    }
+  }
+
+  async function loadExpenses() {
+    if (!user?.id) return;
+    setExpensesLoading(true);
+    try {
+      const res = await apiFetch(`/api/inventory/expenses?owner_id=${user.id}&date=${dcSelectedDate}`);
+      if (res.ok) {
+        const data = await res.json();
+        setExpenses(data.expenses || []);
+      }
+    } catch (e) {
+      console.error('Error loading expenses:', e);
+    } finally {
+      setExpensesLoading(false);
+    }
+  }
+
+  function handleOpenAddExpense() {
+    setNewExpenseCategory('');
+    setNewExpenseAmount('');
+    setNewExpensePaymentMethod('CASH');
+    setNewExpenseNote('');
+    setShowAddExpenseModal(true);
+  }
+
+  async function handleAddExpense() {
+    const amount = parseFloat(newExpenseAmount) || 0;
+    if (amount <= 0) {
+      Alert.alert(t('common_missingField'), t('dc_missingExpenseAmount'));
+      return;
+    }
+    if (!user?.id) return;
+    setAddExpenseLoading(true);
+    try {
+      const res = await apiFetch('/api/inventory/expenses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ownerId: user.id,
+          category: newExpenseCategory.trim() || 'General',
+          amount,
+          paymentMethod: newExpensePaymentMethod,
+          note: newExpenseNote.trim(),
+          date: dcSelectedDate,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setShowAddExpenseModal(false);
+        await Promise.all([loadExpenses(), loadInventoryTransactions(dcSelectedDate)]);
+      } else {
+        Alert.alert(t('common_error'), data.error || t('dc_recordFailed'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setAddExpenseLoading(false);
+    }
+  }
+
+  function handleDeleteExpense(expenseId: string) {
+    if (!user?.id) return;
+    Alert.alert(
+      t('dc_deleteExpenseTitle'),
+      t('dc_deleteExpenseConfirm'),
+      [
+        { text: t('common_cancel'), style: 'cancel' },
+        {
+          text: t('common_delete'),
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const res = await apiFetch(`/api/inventory/expenses/${expenseId}?owner_id=${user.id}`, { method: 'DELETE' });
+              if (res.ok) {
+                await Promise.all([loadExpenses(), loadInventoryTransactions(dcSelectedDate)]);
+              } else {
+                Alert.alert(t('common_error'), t('dc_recordFailed'));
+              }
+            } catch {
+              Alert.alert(t('common_error'), t('common_networkError'));
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  async function handleOpenPriceTrend(item: InventoryItem) {
+    if (!user?.id) return;
+    setPriceTrend(null);
+    setShowPriceTrendModal(true);
+    setPriceTrendLoading(true);
+    try {
+      const res = await apiFetch(`/api/inventory/price-trend?owner_id=${user.id}&product_id=${item.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setPriceTrend(data);
+      }
+    } catch (e) {
+      console.error('Error loading price trend:', e);
+    } finally {
+      setPriceTrendLoading(false);
     }
   }
 
@@ -2538,16 +3410,145 @@ function CustomerAppContent() {
     setSalePaymentMethod('CASH');
     setShowProductPicker(false);
     setShowVendorPicker(false);
+    setShowCustomerPicker(false);
     setInventoryVoiceTranscript('');
     setInventoryVoiceConfirmed(false);
+    if (type === 'PURCHASE') loadVendors();
     setShowRecordSaleModal(true);
   }
 
-  // ---- Fruit Seller "AI Agent": one voice note, classified as either adding a new
-  // product or recording a sale/purchase/wastage. Never saves anything itself - it
-  // only prefills the existing Add Product / Record Sale forms for the owner to
-  // review and confirm, same safeguard used for every other voice feature. ----
-  async function handleStartInventoryVoiceRecording() {
+  function toggleInventoryCartItem(item: InventoryItem) {
+    const isSelected = selectedInventoryIds.includes(item.id);
+    if (isSelected) {
+      setSelectedInventoryIds(previous => previous.filter(id => id !== item.id));
+      setCartQuantities(previous => {
+        const next = { ...previous };
+        delete next[item.id];
+        return next;
+      });
+      return;
+    }
+    if (item.stockQty <= 0) return;
+    setSelectedInventoryIds(previous => previous.includes(item.id) ? previous : [...previous, item.id]);
+    setCartQuantities(previous => ({ ...previous, [item.id]: String(Math.min(1, item.stockQty)) }));
+  }
+
+  function toggleAllInventoryCartItems() {
+    const visibleIds = visibleCartableInventory.map(item => item.id);
+    if (allInventorySelected) {
+      setSelectedInventoryIds(previous => previous.filter(id => !visibleIds.includes(id)));
+      setCartQuantities(previous => {
+        const next = { ...previous };
+        visibleIds.forEach(id => delete next[id]);
+        return next;
+      });
+      return;
+    }
+    setSelectedInventoryIds(previous => [...new Set([...previous, ...visibleIds])]);
+    setCartQuantities(previous => ({
+      ...previous,
+      ...Object.fromEntries(visibleCartableInventory.map(item => [item.id, previous[item.id] || String(Math.min(1, item.stockQty))])),
+    }));
+  }
+
+  function updateInventoryCartQuantity(item: InventoryItem, value: string) {
+    const quantity = Number(value);
+    const safeValue = value !== '' && Number.isFinite(quantity) ? String(Math.min(item.stockQty, Math.max(0, quantity))) : value;
+    setCartQuantities(previous => ({ ...previous, [item.id]: safeValue }));
+  }
+
+  function adjustInventoryCartQuantity(item: InventoryItem, change: number) {
+    const current = Number(cartQuantities[item.id]) || 0;
+    const minimum = Math.min(1, item.stockQty);
+    const next = Math.min(item.stockQty, Math.max(minimum, current + change));
+    setCartQuantities(previous => ({ ...previous, [item.id]: String(next) }));
+  }
+
+  async function handleSaveInventoryCart() {
+    if (!user?.id || cartCheckoutLoading || inventoryCartItems.length === 0) return;
+    if (cartPaymentMethod === 'CREDIT' && !cartCreditCustomerName.trim()) {
+      Alert.alert(t('common_missingField'), t('dc_missingCustomerName'));
+      return;
+    }
+    const lines = inventoryCartItems.map(item => {
+      const quantity = Math.min(item.stockQty, Math.max(0, Number(cartQuantities[item.id]) || 0));
+      return { item, quantity, amount: Number((quantity * item.sellingPrice).toFixed(2)) };
+    });
+    if (lines.some(line => line.quantity <= 0 || line.amount <= 0)) {
+      Alert.alert(t('common_error'), t('inv_cartInvalidLine'));
+      return;
+    }
+
+    setCartCheckoutLoading(true);
+    const today = formatDateISO(new Date());
+    const cartId = lines.length > 1 ? `cart-${user.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` : null;
+    const savedIds: string[] = [];
+    let stoppedOnFailure = false;
+    try {
+      for (const line of lines) {
+        try {
+          const res = await apiFetch('/api/inventory/transactions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ownerId: user.id,
+              productId: line.item.id,
+              quantity: line.quantity,
+              amount: line.amount,
+              type: 'SALE',
+              paymentMethod: cartPaymentMethod,
+              note: cartPaymentMethod === 'CREDIT'
+                ? cartCreditCustomerName.trim()
+                : cartId ? `${INVENTORY_CART_NOTE_PREFIX}${cartId}` : '',
+              date: today,
+              cartId,
+            }),
+          });
+          if (!res.ok) {
+            stoppedOnFailure = true;
+            break;
+          }
+          savedIds.push(line.item.id);
+        } catch {
+          stoppedOnFailure = true;
+          break;
+        }
+      }
+
+      if (savedIds.length > 0) {
+        setExpandedInventoryCartId(cartId);
+        setSelectedInventoryIds(previous => previous.filter(id => !savedIds.includes(id)));
+        setCartQuantities(previous => {
+          const next = { ...previous };
+          savedIds.forEach(id => delete next[id]);
+          return next;
+        });
+        setDcSelectedDate(today);
+        await Promise.all([loadInventoryProducts(), loadInventoryTransactions(today)]);
+        loadRestockSuggestions();
+        if (cartPaymentMethod === 'CREDIT') loadCustomers();
+      }
+
+      if (stoppedOnFailure) {
+        Alert.alert(t('common_error'), t('inv_cartPartialSaved', { saved: savedIds.length, remaining: lines.length - savedIds.length }));
+      } else {
+        setShowInventoryCartModal(false);
+        setCartCreditCustomerName('');
+        setShowCartCustomerPicker(false);
+        Alert.alert(
+          t('inv_cartSavedTitle'),
+          t('inv_cartSavedMessage', {
+            count: lines.length,
+            amount: inventoryCartTotal.toLocaleString('en-IN', { maximumFractionDigits: 2 }),
+          }),
+        );
+      }
+    } finally {
+      setCartCheckoutLoading(false);
+    }
+  }
+
+  async function handleStartInventorySearchRecording() {
     if (!user?.id) return;
     try {
       const perm = await requestRecordingPermissionsAsync();
@@ -2559,15 +3560,15 @@ function CustomerAppContent() {
       await voiceRecorder.prepareToRecordAsync();
       voiceRecorder.record();
       setTimeout(() => {
-        if (voiceRecorder.isRecording) handleStopInventoryVoiceRecording();
+        if (voiceRecorder.isRecording) handleStopInventorySearchRecording();
       }, 8000);
     } catch (e) {
-      console.error('Error starting inventory voice recording:', e);
+      console.error('Error starting product search voice recording:', e);
       Alert.alert(t('common_error'), t('drv_voiceUnavailable'));
     }
   }
 
-  async function handleStopInventoryVoiceRecording() {
+  async function handleStopInventorySearchRecording() {
     if (!user?.id || !voiceRecorder.isRecording) return;
     try {
       await voiceRecorder.stop();
@@ -2576,50 +3577,57 @@ function CustomerAppContent() {
         Alert.alert(t('common_error'), t('drv_voiceUnavailable'));
         return;
       }
-      setInventoryVoiceProcessing(true);
+      setInventorySearchVoiceProcessing(true);
       const audioBase64 = await FileSystem.readAsStringAsync(uri, { encoding: 'base64' });
-      const res = await apiFetch('/api/inventory/voice-agent', {
+      const res = await apiFetch('/api/assistant/voice-chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ownerId: user.id, audioBase64, mimeType: 'audio/mp4' }),
       });
       const data = await res.json();
-      if (data.error) {
-        Alert.alert(t('common_error'), data.error);
+      if (!res.ok || data.error) {
+        Alert.alert(t('common_error'), data.error || t('drv_voiceUnavailable'));
         return;
       }
-      if (data.intent === 'add_product' && data.product?.name) {
-        setNewProductName(data.product.name);
-        setNewProductCategory('');
-        setNewProductUnit(data.product.unit || 'kg');
-        setNewProductStockQty('');
-        setNewProductSellingPrice(data.product.sellingPrice != null ? String(data.product.sellingPrice) : '');
-        setNewProductCostPrice(data.product.costPrice != null ? String(data.product.costPrice) : '');
-        setNewProductLowStock('');
-        setInventoryVoiceTranscript(data.transcript || '');
-        setInventoryVoiceConfirmed(false);
-        setShowAddProductModal(true);
-      } else if (data.intent === 'record_transaction' && data.transaction?.productName) {
-        const matched = inventory.find(p => p.name.toLowerCase() === String(data.transaction.productName).toLowerCase());
-        setSaleProductId(matched ? matched.id : (inventory[0]?.id || ''));
-        setSaleQuantity(data.transaction.quantity != null ? String(data.transaction.quantity) : '');
-        setSaleAmount(data.transaction.amount != null ? String(data.transaction.amount) : '');
-        setSaleNote('');
-        setSaleType(data.transaction.type || 'SALE');
-        setSalePaymentMethod(data.transaction.paymentMethod || 'CASH');
-        setShowProductPicker(false);
-        setInventoryVoiceTranscript(data.transcript || '');
-        setInventoryVoiceConfirmed(false);
-        setShowRecordSaleModal(true);
-      } else {
-        Alert.alert(t('inv_voiceUnclearTitle'), t('inv_voiceUnclearMsg', { transcript: data.transcript || '' }));
+      const transcript = String(data.transcript || '').trim();
+      if (!transcript) {
+        Alert.alert(t('common_error'), t('inv_searchVoiceUnheard'));
+        return;
       }
+      const query = transcript.replace(/^(?:please\s+)?(?:search|find|show)(?:\s+me)?(?:\s+for)?\s+/i, '').trim();
+      setInventorySearchQuery(query || transcript);
     } catch (e) {
-      console.error('Error processing inventory voice recording:', e);
+      console.error('Error transcribing product search:', e);
       Alert.alert(t('common_error'), t('drv_voiceUnavailable'));
     } finally {
-      setInventoryVoiceProcessing(false);
+      setInventorySearchVoiceProcessing(false);
     }
+  }
+
+  function handleCloseProductForm() {
+    setShowAddProductModal(false);
+    setEditingProductId(null);
+    setNewProductName('');
+    setNewProductCategory('');
+    setNewProductUnit('kg');
+    setNewProductStockQty('');
+    setNewProductSellingPrice('');
+    setNewProductCostPrice('');
+    setNewProductLowStock('');
+  }
+
+  function handleOpenEditProduct(item: InventoryItem) {
+    setInventoryVoiceTranscript('');
+    setInventoryVoiceConfirmed(false);
+    setEditingProductId(item.id);
+    setNewProductName(item.name);
+    setNewProductCategory(item.category || '');
+    setNewProductUnit(item.unit || 'kg');
+    setNewProductStockQty(String(item.stockQty));
+    setNewProductSellingPrice(String(item.sellingPrice));
+    setNewProductCostPrice(String(item.costPrice));
+    setNewProductLowStock(String(item.lowStockThreshold));
+    setShowAddProductModal(true);
   }
 
   async function handleAddProduct() {
@@ -2631,10 +3639,15 @@ function CustomerAppContent() {
       Alert.alert(t('common_error'), t('inv_accountError'));
       return;
     }
+    // A blank price would otherwise be saved over the existing one as ₹0.
+    if (editingProductId && !(parseFloat(newProductSellingPrice) > 0)) {
+      Alert.alert(t('common_missingField'), t('rate_invalid', { name: newProductName.trim() }));
+      return;
+    }
     setAddProductLoading(true);
     try {
-      const res = await apiFetch('/api/inventory/products', {
-        method: 'POST',
+      const res = await apiFetch(editingProductId ? `/api/inventory/products/${editingProductId}` : '/api/inventory/products', {
+        method: editingProductId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ownerId: user.id,
@@ -2649,18 +3662,19 @@ function CustomerAppContent() {
       });
       const data = await res.json();
       if (res.ok) {
-        setShowAddProductModal(false);
-        setNewProductName('');
-        setNewProductCategory('');
-        setNewProductUnit('kg');
-        setNewProductStockQty('');
-        setNewProductSellingPrice('');
-        setNewProductCostPrice('');
-        setNewProductLowStock('');
+        const wasEditing = !!editingProductId;
+        handleCloseProductForm();
         await loadInventoryProducts();
-        Alert.alert(t('inv_productAdded'), t('inv_productAddedMsg', { name: data.product.name }));
+        if (wasEditing) {
+          loadRestockSuggestions();
+          loadDailyRates();
+        }
+        Alert.alert(
+          t(wasEditing ? 'inv_productUpdated' : 'inv_productAdded'),
+          t(wasEditing ? 'inv_productUpdatedMsg' : 'inv_productAddedMsg', { name: data.product.name }),
+        );
       } else {
-        Alert.alert(t('common_error'), data.error || t('inv_addFailed'));
+        Alert.alert(t('common_error'), data.error || t(editingProductId ? 'inv_updateFailed' : 'inv_addFailed'));
       }
     } catch {
       Alert.alert(t('common_error'), t('common_networkError'));
@@ -2669,7 +3683,7 @@ function CustomerAppContent() {
     }
   }
 
-  async function handleRecordSale() {
+  async function handleRecordSale(confirmedOverStock = false) {
     if (!saleProductId) {
       Alert.alert(t('common_missingField'), t('dc_missingProduct'));
       return;
@@ -2699,6 +3713,24 @@ function CustomerAppContent() {
       return;
     }
     const paidNow = saleType === 'PURCHASE' && salePaidNow.trim() !== '' ? parseFloat(salePaidNow) || 0 : undefined;
+
+    // Selling or wasting more than is in stock is usually a typo or stale stock -
+    // check with the owner instead of silently zeroing the stock.
+    const product = inventory.find(i => i.id === saleProductId);
+    if (!confirmedOverStock && saleType !== 'PURCHASE' && product && quantity > product.stockQty) {
+      Alert.alert(
+        t('dc_overStockTitle'),
+        t('dc_overStockMsg', { stock: product.stockQty, unit: product.unit, product: product.name, quantity }),
+        [
+          { text: t('common_cancel'), style: 'cancel' },
+          { text: t('dc_overStockConfirm'), onPress: () => handleRecordSale(true) },
+        ]
+      );
+      return;
+    }
+
+    // Entries made while Daily Collection is showing another day belong to that day.
+    const entryDate = activeTab === 'daily_collection' ? dcSelectedDate : formatDateISO(new Date());
     setRecordSaleLoading(true);
     try {
       const res = await apiFetch('/api/inventory/transactions', {
@@ -2712,15 +3744,35 @@ function CustomerAppContent() {
           type: saleType,
           paymentMethod: salePaymentMethod,
           note: saleNote.trim(),
+          date: entryDate,
           ...(paidNow !== undefined ? { amountPaid: paidNow } : {}),
         }),
       });
       const data = await res.json();
       if (res.ok) {
         setShowRecordSaleModal(false);
+        const shareBillButton = {
+          text: `📤 ${t('dc_shareBillBtn')}`,
+          onPress: () => {
+            Share.share({
+              message: t('dc_billMessage', {
+                business: user?.fullName || '',
+                item: quantity > 0 ? `${quantity} ${data.transaction.unit} ${data.transaction.productName}` : data.transaction.productName,
+                amount: data.transaction.amount,
+                method: salePaymentMethod,
+                date: data.transaction.date,
+              }),
+            }).catch(() => {});
+          },
+        };
         await Promise.all([loadInventoryProducts(), loadInventoryTransactions()]);
         loadRestockSuggestions();
+        if (activeTab === 'home') {
+          loadHomeSnapshot();
+          loadInventoryInsights();
+        }
         if (saleType === 'PURCHASE') loadVendors();
+        if (saleType === 'SALE' && salePaymentMethod === 'CREDIT') loadCustomers();
         if (saleType === 'WASTAGE') {
           Alert.alert(t('dc_wastageRecorded'), `${quantity} ${data.transaction.unit} ${t('inv_product').toLowerCase()} "${data.transaction.productName}" ₹${data.transaction.amount}`);
         } else if (saleType === 'PURCHASE') {
@@ -2730,8 +3782,31 @@ function CustomerAppContent() {
             `${quantity} ${data.transaction.unit} — "${data.transaction.productName}" ₹${data.transaction.amount}` +
               (due > 0 ? `\n${t('dc_dueToVendor', { amount: due })}` : '')
           );
+        } else if (salePaymentMethod === 'CREDIT' && (data.transaction.amountDue || 0) > 0) {
+          const customerName = saleNote.trim();
+          const matchedCustomer = customers.find((c: any) => c.customerName.toLowerCase() === customerName.toLowerCase());
+          const bodyMsg = `₹${data.transaction.amount} — "${data.transaction.productName}"\n${t('dc_customerOwes', { amount: data.transaction.amountDue, customer: customerName })}`;
+          if (matchedCustomer?.mobileNumber) {
+            Alert.alert(t('dc_saleRecorded'), bodyMsg, [
+              { text: t('common_ok') },
+              {
+                text: `💬 ${t('dc_sendReceiptBtn')}`,
+                onPress: () => sendBookingWhatsApp(
+                  matchedCustomer.mobileNumber,
+                  t('dc_receiptMessage', {
+                    business: user?.fullName || '',
+                    product: data.transaction.productName,
+                    quantity: `${quantity} ${data.transaction.unit}`,
+                    amount: data.transaction.amount,
+                  })
+                ),
+              },
+            ]);
+          } else {
+            Alert.alert(t('dc_saleRecorded'), bodyMsg, [{ text: t('common_ok') }, shareBillButton]);
+          }
         } else {
-          Alert.alert(t('dc_saleRecorded'), `₹${data.transaction.amount} — "${data.transaction.productName}"`);
+          Alert.alert(t('dc_saleRecorded'), `₹${data.transaction.amount} — "${data.transaction.productName}"`, [{ text: t('common_ok') }, shareBillButton]);
         }
       } else {
         Alert.alert(t('common_error'), data.error || t('dc_recordFailed'));
@@ -2808,6 +3883,169 @@ function CustomerAppContent() {
     );
   }
 
+  function handleDeleteSelectedProducts() {
+    const selectedProducts = inventory.filter(item => selectedInventoryIds.includes(item.id));
+    if (!user?.id || selectedProducts.length === 0) return;
+
+    Alert.alert(
+      t('inv_deleteSelectedTitle'),
+      t('inv_deleteSelectedConfirm', { count: selectedProducts.length }),
+      [
+        { text: t('common_cancel'), style: 'cancel' },
+        {
+          text: t('common_delete'),
+          style: 'destructive',
+          onPress: async () => {
+            setDeleteSelectedLoading(true);
+            const deletedIds: string[] = [];
+            let failedCount = 0;
+            try {
+              for (const item of selectedProducts) {
+                try {
+                  const res = await apiFetch(`/api/inventory/products/${item.id}?owner_id=${user.id}`, { method: 'DELETE' });
+                  if (res.ok) deletedIds.push(item.id);
+                  else failedCount += 1;
+                } catch {
+                  failedCount += 1;
+                }
+              }
+              if (deletedIds.length > 0) {
+                setSelectedInventoryIds(previous => previous.filter(id => !deletedIds.includes(id)));
+                setCartQuantities(previous => {
+                  const next = { ...previous };
+                  deletedIds.forEach(id => delete next[id]);
+                  return next;
+                });
+                await loadInventoryProducts();
+              }
+              if (failedCount > 0) {
+                Alert.alert(t('common_error'), t('inv_deleteSelectedFailed', { count: failedCount }));
+              }
+            } finally {
+              setDeleteSelectedLoading(false);
+            }
+          },
+        },
+      ],
+    );
+  }
+
+  function handleOpenSelectedPurchase() {
+    const selectedProducts = inventory.filter(item => selectedInventoryIds.includes(item.id));
+    if (selectedProducts.length === 0) return;
+    setSelectedPurchaseQuantities(Object.fromEntries(selectedProducts.map(item => [item.id, ''])));
+    setSelectedPurchaseAmounts(Object.fromEntries(selectedProducts.map(item => [item.id, ''])));
+    setSelectedPurchasePaid(Object.fromEntries(selectedProducts.map(item => [item.id, false])));
+    setSelectedPurchaseVendors(Object.fromEntries(selectedProducts.map(item => [item.id, ''])));
+    setSelectedPurchaseVendorPickerId(null);
+    setShowSelectedPurchaseModal(true);
+    loadVendors();
+  }
+
+  async function handleSaveSelectedPurchase() {
+    if (!user?.id || selectedPurchaseSaving) return;
+    const selectedProducts = inventory.filter(item => selectedInventoryIds.includes(item.id));
+    if (selectedProducts.length === 0) return;
+    const purchaseLines = selectedProducts.map(item => ({
+      item,
+      quantity: Number(selectedPurchaseQuantities[item.id]) || 0,
+      amount: Number(selectedPurchaseAmounts[item.id]) || 0,
+      paid: !!selectedPurchasePaid[item.id],
+      vendor: selectedPurchaseVendors[item.id] || '',
+    }));
+    if (purchaseLines.some(line => line.quantity <= 0)) {
+      Alert.alert(t('common_missingField'), t('dc_missingPurchaseQty'));
+      return;
+    }
+    if (purchaseLines.some(line => line.amount <= 0)) {
+      Alert.alert(t('common_missingField'), t('dc_missingPurchaseAmount'));
+      return;
+    }
+    if (purchaseLines.some(line => !line.vendor.trim())) {
+      Alert.alert(t('common_missingField'), t('dc_missingVendorName'));
+      return;
+    }
+
+    setSelectedPurchaseSaving(true);
+    const today = formatDateISO(new Date());
+    const cartId = purchaseLines.length > 1 ? `purchase-${user.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` : null;
+    const savedIds: string[] = [];
+    let failed = false;
+    try {
+      for (const line of purchaseLines) {
+        try {
+          const res = await apiFetch('/api/inventory/transactions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ownerId: user.id,
+              productId: line.item.id,
+              quantity: line.quantity,
+              amount: line.amount,
+              type: 'PURCHASE',
+              paymentMethod: 'CASH',
+              amountPaid: line.paid ? line.amount : 0,
+              note: line.vendor.trim(),
+              date: today,
+              cartId,
+            }),
+          });
+          if (!res.ok) {
+            failed = true;
+            break;
+          }
+          savedIds.push(line.item.id);
+        } catch {
+          failed = true;
+          break;
+        }
+      }
+
+      if (savedIds.length > 0) {
+        setSelectedInventoryIds(previous => previous.filter(id => !savedIds.includes(id)));
+        setCartQuantities(previous => {
+          const next = { ...previous };
+          savedIds.forEach(id => delete next[id]);
+          return next;
+        });
+        setSelectedPurchaseQuantities(previous => {
+          const next = { ...previous };
+          savedIds.forEach(id => delete next[id]);
+          return next;
+        });
+        setSelectedPurchaseAmounts(previous => {
+          const next = { ...previous };
+          savedIds.forEach(id => delete next[id]);
+          return next;
+        });
+        setSelectedPurchasePaid(previous => {
+          const next = { ...previous };
+          savedIds.forEach(id => delete next[id]);
+          return next;
+        });
+        setSelectedPurchaseVendors(previous => {
+          const next = { ...previous };
+          savedIds.forEach(id => delete next[id]);
+          return next;
+        });
+        setSelectedPurchaseVendorPickerId(null);
+        setDcSelectedDate(today);
+        await Promise.all([loadInventoryProducts(), loadInventoryTransactions(today), loadVendors()]);
+        loadRestockSuggestions();
+      }
+
+      if (failed) {
+        Alert.alert(t('common_error'), t('inv_bulkPurchasePartial', { saved: savedIds.length, remaining: purchaseLines.length - savedIds.length }));
+      } else {
+        setShowSelectedPurchaseModal(false);
+        setSelectedPurchaseVendors({});
+        Alert.alert(t('dc_purchaseRecorded'), t('inv_bulkPurchaseSaved', { count: savedIds.length }));
+      }
+    } finally {
+      setSelectedPurchaseSaving(false);
+    }
+  }
+
   function handleDeleteTransaction(tx: any) {
     if (!user?.id) return;
     Alert.alert(
@@ -2826,6 +4064,233 @@ function CustomerAppContent() {
               } else {
                 const data = await res.json();
                 Alert.alert(t('common_error'), data.error || t('dc_deleteTxFailed'));
+              }
+            } catch {
+              Alert.alert(t('common_error'), t('common_networkError'));
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  function handleOpenEditTransaction(tx: any) {
+    setEditTxQuantity(tx.quantity ? String(tx.quantity) : '');
+    setEditTxAmount(String(tx.amount ?? ''));
+    setEditTxPaid(String(tx.amountPaid ?? ''));
+    setEditTxDate(tx.date || '');
+    setEditTx(tx);
+  }
+
+  // Purchases and credit sales can be part-paid; for everything else "paid" always equals the amount.
+  const editTxPartPayable = !!editTx && (editTx.type === 'PURCHASE' || (editTx.type === 'SALE' && editTx.paymentMethod === 'CREDIT'));
+
+  async function handleSaveEditTransaction() {
+    if (!user?.id || !editTx) return;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(editTxDate.trim())) {
+      Alert.alert(t('common_error'), t('dc_editBadDate'));
+      return;
+    }
+    setEditTxSaving(true);
+    try {
+      const res = await apiFetch(`/api/inventory/transactions/${editTx.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ownerId: user.id,
+          quantity: parseFloat(editTxQuantity) || 0,
+          amount: parseFloat(editTxAmount) || 0,
+          date: editTxDate.trim(),
+          ...(editTxPartPayable ? { amountPaid: parseFloat(editTxPaid) || 0 } : {}),
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setEditTx(null);
+        await Promise.all([loadInventoryProducts(), loadInventoryTransactions()]);
+        loadVendors();
+        loadCustomers();
+      } else {
+        Alert.alert(t('common_error'), data.error || t('dc_editFailed'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setEditTxSaving(false);
+    }
+  }
+
+  function handleOpenEditParty(side: 'vendor' | 'customer') {
+    const ledger = side === 'vendor' ? vendorLedger : customerLedger;
+    const name = side === 'vendor' ? vendorLedgerName : customerLedgerName;
+    setEditPartyName(name);
+    setEditPartyMobile(ledger?.mobileNumber || '');
+    setEditPartyEmail(ledger?.email || '');
+    setEditPartyAddress(ledger?.address || '');
+    setEditParty({ side, originalName: name });
+  }
+
+  async function handleSaveEditParty() {
+    if (!user?.id || !editParty) return;
+    if (!editPartyName.trim()) {
+      Alert.alert(t('common_missingField'), t(editParty.side === 'vendor' ? 'dc_vendorNameLabel' : 'dc_customerNameLabel'));
+      return;
+    }
+    setEditPartySaving(true);
+    try {
+      const res = await apiFetch(`/api/inventory/${editParty.side}s`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ownerId: user.id,
+          name: editParty.originalName,
+          newName: editPartyName.trim(),
+          mobileNumber: editPartyMobile.trim(),
+          email: editPartyEmail.trim(),
+          address: editPartyAddress.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        const side = editParty.side;
+        setEditParty(null);
+        if (side === 'vendor') {
+          setSelectedVendorNames(previous => previous.map(name => name === editParty.originalName ? data.name : name));
+          setVendorLedgerName(data.name);
+          await loadVendorLedger(data.name);
+          loadVendors();
+        } else {
+          setSelectedCustomerNames(previous => previous.map(name => name === editParty.originalName ? data.name : name));
+          setCustomerLedgerName(data.name);
+          await loadCustomerLedger(data.name);
+          loadCustomers();
+        }
+        loadInventoryTransactions();
+      } else {
+        Alert.alert(t('common_error'), data.error || t('dc_editFailed'));
+      }
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setEditPartySaving(false);
+    }
+  }
+
+  // Builds a PDF statement of account from the open vendor / customer ledger (every
+  // entry and payment, oldest first, with a running balance) and opens the share sheet.
+  async function handleShareStatement(side: 'vendor' | 'customer') {
+    const isVendor = side === 'vendor';
+    const ledger = isVendor ? vendorLedger : customerLedger;
+    const name = isVendor ? vendorLedgerName : customerLedgerName;
+    if (!ledger || statementExporting) return;
+    setStatementExporting(true);
+    try {
+      const rows: { date: string; label: string; delta: number }[] = [];
+      ((isVendor ? ledger.purchases : ledger.sales) || []).slice().reverse().forEach((e: any) => {
+        rows.push({
+          date: e.date,
+          label: `${t(isVendor ? 'dc_vendorGotEntry' : 'dc_customerTookEntry')}: ${e.productName} (${e.quantity} ${e.unit})`,
+          delta: isVendor ? e.totalCost : e.totalAmount,
+        });
+        if (e.amountPaid > 0) {
+          rows.push({
+            date: e.date,
+            label: `${t(isVendor ? 'dc_vendorGaveEntry' : 'dc_customerPaidEntry')} (${t('dc_vendorPaidAtPurchase')})`,
+            delta: -e.amountPaid,
+          });
+        }
+      });
+      (ledger.payments || []).slice().reverse().forEach((pay: any) => {
+        rows.push({
+          date: pay.date,
+          label: `${t(isVendor ? 'dc_vendorGaveEntry' : 'dc_customerPaidEntry')} · ${pay.paymentMethod}${pay.note ? ` · ${pay.note}` : ''}`,
+          delta: -pay.amount,
+        });
+      });
+      rows.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+      const cell = 'border:1px solid #e2e8f0;';
+      let running = 0;
+      const bodyRows = rows.map(r => {
+        running += r.delta;
+        return `<tr><td style="${cell}">${escapeHtml(r.date || '')}</td><td style="${cell}">${escapeHtml(r.label)}</td>` +
+          `<td style="${cell} text-align:right; color:${r.delta >= 0 ? '#b45309' : '#15803d'};">${r.delta >= 0 ? '+' : '−'}₹${Math.abs(r.delta).toLocaleString()}</td>` +
+          `<td style="${cell} text-align:right;">₹${running.toLocaleString()}</td></tr>`;
+      }).join('');
+      const totals = ledger.totals || {};
+      const totalRows: [string, number][] = isVendor
+        ? [[t('dc_vendorTotalPurchased'), totals.totalCost], [t('dc_vendorTotalPaid'), totals.totalPaid], [t('dc_vendorTotalDue'), totals.totalDue]]
+        : [[t('dc_customerTotalSold'), totals.totalSold], [t('dc_customerTotalReceived'), totals.totalReceived], [t('dc_customerTotalDue'), totals.totalDue]];
+      const contact = [ledger.mobileNumber, ledger.email, ledger.address].filter(Boolean).join(' · ');
+      const html = `
+        <html>
+          <head><meta charset="utf-8"/></head>
+          <body style="font-family: Helvetica, Arial, sans-serif; color: #1e293b; padding: 24px;">
+            <h1 style="margin-bottom: 2px;">${escapeHtml(t('dc_statementTitle'))}</h1>
+            <div style="color: #64748b; margin-bottom: 18px;">${escapeHtml(user?.fullName || '')} · ${formatDateISO(new Date())}</div>
+            <h2 style="margin-bottom: 2px;">${escapeHtml(name)}</h2>
+            <div style="color: #64748b; margin-bottom: 18px;">${escapeHtml(contact)}</div>
+            <table style="width:100%; border-collapse: collapse; margin-bottom: 24px;" cellpadding="8">
+              ${totalRows.map(([label, value], i) => `<tr><td style="${cell}${i === 2 ? ' font-weight:bold;' : ''}">${escapeHtml(label)}</td><td style="${cell} text-align:right;${i === 2 ? ' font-weight:bold;' : ''}">₹${(value || 0).toLocaleString()}</td></tr>`).join('')}
+            </table>
+            <table style="width:100%; border-collapse: collapse; font-size: 12px;" cellpadding="6">
+              <tr style="background:#f1f5f9;"><th style="${cell} text-align:left;">${escapeHtml(t('dc_stmtDate'))}</th><th style="${cell} text-align:left;">${escapeHtml(t('dc_stmtParticulars'))}</th><th style="${cell} text-align:right;">${escapeHtml(t('dc_stmtAmount'))}</th><th style="${cell} text-align:right;">${escapeHtml(t('dc_vendorBalance'))}</th></tr>
+              ${bodyRows || `<tr><td colspan="4" style="${cell} text-align:center; color:#94a3b8;">${escapeHtml(t('dc_noVendorActivity'))}</td></tr>`}
+            </table>
+          </body>
+        </html>
+      `;
+      const { uri } = await Print.printToFileAsync({ html });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: `${t('dc_statementTitle')} - ${name}` });
+      } else {
+        Alert.alert(t('common_error'), t('drv_reportsShareUnavailable'));
+      }
+    } catch (e) {
+      console.error('Error exporting statement PDF:', e);
+      Alert.alert(t('common_error'), t('dc_stmtFailed'));
+    } finally {
+      setStatementExporting(false);
+    }
+  }
+
+  // Deletes one passbook row from a vendor / customer ledger: either the underlying
+  // purchase / credit sale ('tx') or a follow-up payment ('payment').
+  function handleDeletePassbookEntry(
+    side: 'vendor' | 'customer',
+    entry: { kind: 'tx' | 'payment'; id: string; amount: number; productName?: string },
+  ) {
+    if (!user?.id) return;
+    const isTx = entry.kind === 'tx';
+    Alert.alert(
+      t(isTx ? 'dc_deleteTxTitle' : 'dc_deletePaymentTitle'),
+      isTx
+        ? t('dc_deleteTxConfirm', { amount: entry.amount, product: entry.productName || '' })
+        : t('dc_deletePaymentConfirm', { amount: entry.amount }),
+      [
+        { text: t('common_cancel'), style: 'cancel' },
+        {
+          text: t('common_delete'),
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const path = isTx ? `transactions/${entry.id}` : `${side}-payments/${entry.id}`;
+              const res = await apiFetch(`/api/inventory/${path}?owner_id=${user.id}`, { method: 'DELETE' });
+              if (res.ok) {
+                if (side === 'vendor') {
+                  await loadVendorLedger(vendorLedgerName);
+                  loadVendors();
+                } else {
+                  await loadCustomerLedger(customerLedgerName);
+                  loadCustomers();
+                }
+                if (isTx) {
+                  loadInventoryProducts();
+                  loadInventoryTransactions();
+                }
+              } else {
+                const data = await res.json();
+                Alert.alert(t('common_error'), data.error || t(isTx ? 'dc_deleteTxFailed' : 'dc_deletePaymentFailed'));
               }
             } catch {
               Alert.alert(t('common_error'), t('common_networkError'));
@@ -3263,8 +4728,9 @@ function CustomerAppContent() {
     { key: 'driver_reports', label: t('nav_driverReports'), icon: '📊', show: hasFeature('trips') || isTravelBusiness },
     { key: 'inventory', label: t('nav_inventory'), icon: '📦', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'daily_collection', label: t('nav_dailyCollection'), icon: '💰', show: hasFeature('inventory') || hasFeature('products') },
-    { key: 'inventory_insights', label: t('nav_insights'), icon: '📊', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'vendors', label: t('nav_vendors'), icon: '🏪', show: hasFeature('inventory') || hasFeature('products') },
+    { key: 'customers', label: t('nav_customers'), icon: '🧑‍🤝‍🧑', show: hasFeature('inventory') || hasFeature('products') },
+    { key: 'inventory_insights', label: t('nav_insights'), icon: '📊', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'sales', label: t('nav_salesPos'), icon: '🛒', show: hasFeature('sales') },
     { key: 'service_jobs', label: t('nav_jobCards'), icon: '🔧', show: hasFeature('service_jobs') },
     { key: 'building_setup', label: t('bld_navBuilding'), icon: '🏢', show: isBuildingBusiness },
@@ -3438,6 +4904,7 @@ function CustomerAppContent() {
       }
 
       const userData = result.user;
+      authToken = result.token || null;
 
       // GUARD: If an administrator account attempts to sign in
       if (userData.userType === 'admin') {
@@ -4210,13 +5677,38 @@ function CustomerAppContent() {
     ]);
   }
 
+  function announceNewQrPayments(loaded: DriverTrip[]) {
+    const qrTrips = loaded.filter(tr => tr.qr);
+    const known = announcedQrTrips.current;
+    announcedQrTrips.current = new Set(qrTrips.map(tr => tr.id));
+    // First load of the session: these were already there, nothing to announce.
+    if (!known || !paySoundOnRef.current) return;
+    const fresh = qrTrips.filter(tr => !known.has(tr.id));
+    if (fresh.length === 0) return;
+    const total = fresh.reduce((sum, tr) => sum + tr.fare, 0);
+    speakConfirmation(t('drv_paySpoken', { amount: total }), language);
+  }
+
+  function handleTogglePaySound() {
+    const next = !paySoundOn;
+    setPaySoundOn(next);
+    if (user?.id) AsyncStorage.setItem(`paySound_${user.id}`, next ? '1' : '0').catch(() => {});
+    if (next) speakConfirmation(t('drv_paySpoken', { amount: 50 }), language);
+  }
+
+  useEffect(() => {
+    if (!user?.id) return;
+    announcedQrTrips.current = null;
+    AsyncStorage.getItem(`paySound_${user.id}`).then(v => setPaySoundOn(v !== '0')).catch(() => {});
+  }, [user?.id]);
+
   async function loadDriverTrips() {
     if (!user?.id) return;
     try {
       const res = await apiFetch(`/api/driver/trips?owner_id=${user.id}`);
       if (!res.ok) return;
       const data = await res.json();
-      setTrips((data.trips || []).map((tr: any): DriverTrip => ({
+      const loaded: DriverTrip[] = (data.trips || []).map((tr: any): DriverTrip => ({
         id: tr.id,
         tripDate: 'Today',
         time: new Date(tr.tripTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
@@ -4230,7 +5722,10 @@ function CustomerAppContent() {
         locationName: tr.locationName || '',
         latitude: tr.latitude ?? null,
         longitude: tr.longitude ?? null,
-      })));
+        qr: tr.payment || null,
+      }));
+      setTrips(loaded);
+      announceNewQrPayments(loaded);
     } catch (e) {
       console.error('Error loading trips:', e);
     }
@@ -4261,23 +5756,28 @@ function CustomerAppContent() {
     if (user?.id && hasFeature('trips') && activeTab === 'home') loadDriverTripsHistory();
   }, [user?.id, activeTab]);
 
+  function toFuelLog(f: any): FuelLog {
+    return {
+      id: f.id,
+      date: new Date(f.fuelTime).toLocaleString([], { hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' }),
+      fuelTimeMs: new Date(f.fuelTime).getTime(),
+      fuelType: f.fuelType,
+      quantity: f.quantity || 0,
+      rate: f.rate || 0,
+      totalCost: f.totalCost || 0,
+      odometer: f.odometer ?? 0,
+      station: f.station || '',
+      paymentMode: f.paymentMode === 'UPI' ? 'UPI' : 'Cash',
+    };
+  }
+
   async function loadDriverFuelLogs() {
     if (!user?.id) return;
     try {
       const res = await apiFetch(`/api/driver/fuel-logs?owner_id=${user.id}`);
       if (!res.ok) return;
       const data = await res.json();
-      setFuelLogs((data.fuelLogs || []).map((f: any): FuelLog => ({
-        id: f.id,
-        date: new Date(f.fuelTime).toLocaleString([], { hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short' }),
-        fuelTimeMs: new Date(f.fuelTime).getTime(),
-        fuelType: f.fuelType,
-        quantity: f.quantity || 0,
-        rate: f.rate || 0,
-        totalCost: f.totalCost || 0,
-        odometer: f.odometer ?? 0,
-        station: f.station || '',
-      })));
+      setFuelLogs((data.fuelLogs || []).map(toFuelLog));
     } catch (e) {
       console.error('Error loading fuel logs:', e);
     }
@@ -4295,6 +5795,14 @@ function CustomerAppContent() {
       })));
     } catch (e) {
       console.error('Error loading fuel log history:', e);
+    }
+    try {
+      const res = await apiFetch(`/api/driver/fuel-logs?owner_id=${user.id}&all=1`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setFuelLogsAll((data.fuelLogs || []).map(toFuelLog));
+    } catch (e) {
+      console.error('Error loading all fuel logs:', e);
     }
   }
 
@@ -6095,6 +7603,121 @@ function CustomerAppContent() {
     }
   }
 
+  function handleDeleteFuelLog(log: FuelLog) {
+    if (!user?.id) return;
+    Alert.alert(t('drv_fuelDeleteTitle'), t('drv_fuelDeleteConfirm', { amount: log.totalCost.toLocaleString() }), [
+      { text: t('common_cancel'), style: 'cancel' },
+      {
+        text: t('common_delete'),
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            const res = await apiFetch(`/api/driver/fuel-logs/${log.id}?owner_id=${user.id}`, { method: 'DELETE' });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              Alert.alert(t('common_error'), err.error || t('common_networkError'));
+              return;
+            }
+            // The Trips grid and the 7-day chart read these same lists, so the entry disappears there too.
+            loadDriverFuelLogs();
+            loadDriverFuelLogsHistory();
+          } catch {
+            Alert.alert(t('common_error'), t('common_networkError'));
+          }
+        },
+      },
+    ]);
+  }
+
+  function handleOpenQuickFuel() {
+    setQuickFuelAmount('');
+    setQuickFuelMode('Cash');
+    // Start on the vehicle's own fuel; anything that is not CNG or petrol counts as Other.
+    setQuickFuelType(vehicle.fuelType === 'CNG' || vehicle.fuelType === 'Petrol' ? vehicle.fuelType : 'Other');
+    setShowQuickFuelModal(true);
+  }
+
+  // Hands over to the chosen UPI app to pay the pump. The app cannot see whether the payment
+  // went through, so the fuel is saved only after the driver confirms it on his return.
+  async function handlePayFuelWithApp(app: { name: string; urls: string[] }) {
+    const amount = Math.round(parseFloat(quickFuelAmount));
+    if (isNaN(amount) || amount <= 0) {
+      Alert.alert(t('common_error'), t('drv_missingCashAmount'));
+      return;
+    }
+    fuelPayLeftApp.current = false;
+    for (const url of app.urls) {
+      try {
+        await Linking.openURL(url);
+        setFuelPayApp(app.name);
+        return;
+      } catch {
+        // try this app's next known link
+      }
+    }
+    Alert.alert(t('common_error'), t('drv_fuelAppMissing', { app: app.name }));
+  }
+
+  useEffect(() => {
+    if (!fuelPayApp) return;
+    const subscription = AppState.addEventListener('change', nextState => {
+      if (nextState !== 'active') {
+        fuelPayLeftApp.current = true;
+        return;
+      }
+      if (!fuelPayLeftApp.current) return;
+      const app = fuelPayApp;
+      setFuelPayApp(null);
+      Alert.alert(
+        t('drv_fuelPaidTitle'),
+        t('drv_fuelPaidMsg', { amount: Math.round(parseFloat(quickFuelAmount) || 0).toLocaleString(), app }),
+        [
+          { text: t('drv_fuelPaidNo'), style: 'cancel' },
+          { text: t('drv_fuelPaidYes'), onPress: () => handleSaveQuickFuel() },
+        ],
+      );
+    });
+    return () => subscription.remove();
+  }, [fuelPayApp, quickFuelAmount, quickFuelType]);
+
+  async function handleSaveQuickFuel() {
+    if (!user?.id || quickFuelSaving) return;
+    const amount = Math.round(parseFloat(quickFuelAmount));
+    if (isNaN(amount) || amount <= 0) {
+      Alert.alert(t('common_error'), t('drv_missingCashAmount'));
+      return;
+    }
+    setQuickFuelSaving(true);
+    try {
+      const res = await apiFetch('/api/driver/fuel-logs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ownerId: user.id,
+          fuelType: quickFuelType,
+          quantity: 0,
+          rate: 0,
+          totalCost: amount,
+          odometer: vehicle.totalKm,
+          station: '',
+          paymentMode: quickFuelMode,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        Alert.alert(t('common_error'), err.error || t('common_networkError'));
+        return;
+      }
+      setShowQuickFuelModal(false);
+      loadDriverFuelLogs();
+      loadDriverFuelLogsHistory();
+    } catch {
+      Alert.alert(t('common_error'), t('common_networkError'));
+    } finally {
+      setQuickFuelSaving(false);
+    }
+  }
+
   async function handleAddFuel() {
     const qtyNum = parseFloat(fuelQty);
     const rateNum = parseFloat(fuelRate) || (fuelTypeChoice === 'Diesel' ? 92 : 85);
@@ -6231,12 +7854,93 @@ function CustomerAppContent() {
     .reduce((acc, item) => acc + (item.expectedAmount || item.expected_amount || item.amount || 0), 0);
 
   // Business-specific KPI metrics
-  const totalTripDistance = estimateTotalDistanceKm(trips);
+  // GPS-tracked distance while on duty; until any is tracked, fall back to the estimate from trip locations.
+  const duty = useDutyDistance(user?.id, !isTravelBusiness && hasFeature('trips'), apiFetch);
+  const totalTripDistance = duty.todayKm > 0 ? duty.todayKm : estimateTotalDistanceKm(trips);
+
+  // End-of-day summary: opens by itself once, the first time the app is used after 8 PM
+  useEffect(() => {
+    if (!user?.id || isTravelBusiness || !hasFeature('trips')) return;
+    if (new Date().getHours() < 20 || trips.length + fuelLogs.length === 0) return;
+    const key = `daySummary_${user.id}_${new Date().toDateString()}`;
+    AsyncStorage.getItem(key)
+      .then(seen => {
+        if (seen) return;
+        AsyncStorage.setItem(key, '1').catch(() => {});
+        setShowDaySummary(true);
+      })
+      .catch(() => {});
+  }, [user?.id, trips.length, fuelLogs.length, activeTab]);
+
+  function getDaySummary() {
+    const cash = trips.filter(tr => tr.paymentMode === 'Cash').reduce((sum, tr) => sum + tr.fare, 0);
+    const upi = trips.filter(tr => tr.paymentMode === 'UPI').reduce((sum, tr) => sum + tr.fare, 0);
+    const fuel = fuelLogs.reduce((sum, f) => sum + f.totalCost, 0);
+    const fuelQty = fuelLogs.reduce((sum, f) => sum + f.quantity, 0);
+    const km = totalTripDistance;
+    return {
+      count: trips.length,
+      cash,
+      upi,
+      fuel,
+      net: cash + upi - fuel,
+      km,
+      // Both need a tracked distance; mileage also needs fills entered with a quantity.
+      fuelPerKm: km > 0 && fuel > 0 ? Math.round((fuel / km) * 10) / 10 : null,
+      mileage: km > 0 && fuelQty > 0 ? Math.round((km / fuelQty) * 10) / 10 : null,
+    };
+  }
+
+  function getDaySummaryRows() {
+    const sum = getDaySummary();
+    const rows: { label: string; value: string; tone?: 'good' | 'bad' }[] = [
+      { label: t('drv_sumPayments'), value: String(sum.count) },
+      { label: t('drv_recordCash'), value: `₹${sum.cash.toLocaleString()}` },
+      { label: 'UPI', value: `₹${sum.upi.toLocaleString()}` },
+      { label: t('drv_fuelBadge'), value: `-₹${sum.fuel.toLocaleString()}`, tone: sum.fuel > 0 ? 'bad' : undefined },
+      { label: t('trip_netEarnings'), value: `${sum.net < 0 ? '-' : ''}₹${Math.abs(sum.net).toLocaleString()}`, tone: sum.net < 0 ? 'bad' : 'good' },
+      { label: t('trip_distance'), value: `${sum.km} km` },
+    ];
+    if (sum.fuelPerKm != null) rows.push({ label: t('drv_sumFuelPerKm'), value: `₹${sum.fuelPerKm}` });
+    if (sum.mileage != null) rows.push({ label: t('drv_sumMileage'), value: `${sum.mileage} km` });
+    return rows;
+  }
+
+  function handleShareDaySummary() {
+    const lines = getDaySummaryRows().map(row => `${row.label}: ${row.value}`);
+    Share.share({
+      message: `${t('drv_sumTitle')} - ${new Date().toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' })}\n${lines.join('\n')}`,
+    }).catch(() => {});
+  }
   const totalTripEarnings = trips.reduce((acc, t) => acc + t.fare, 0);
   const totalFuelCost = fuelLogs.reduce((acc, f) => acc + f.totalCost, 0);
   const totalFuelLitres = fuelLogs.reduce((acc, f) => acc + f.quantity, 0);
   const totalInventoryItems = inventory.reduce((acc, i) => acc + i.stockQty, 0);
   const lowStockCount = inventory.filter(i => i.stockQty <= i.lowStockThreshold).length;
+  const cartableInventory = inventory.filter(item => item.stockQty > 0);
+  const searchTerm = inventorySearchQuery.trim().toLocaleLowerCase();
+  const filteredInventory = inventory.filter(item =>
+    !searchTerm || `${item.name} ${item.category}`.toLocaleLowerCase().includes(searchTerm),
+  );
+  const visibleCartableInventory = filteredInventory.filter(item => item.stockQty > 0);
+  const inventoryCartItems = cartableInventory.filter(item => selectedInventoryIds.includes(item.id));
+  const selectedInventoryCount = inventoryCartItems.length;
+  const allInventorySelected = visibleCartableInventory.length > 0 && visibleCartableInventory.every(item => selectedInventoryIds.includes(item.id));
+  const inventoryCartTotal = inventoryCartItems.reduce((total, item) => {
+    const quantity = Math.min(item.stockQty, Math.max(0, Number(cartQuantities[item.id]) || 0));
+    return total + quantity * item.sellingPrice;
+  }, 0);
+  const groupedDailyTransactions = Array.from(inventoryTransactions.reduce<Map<string, { key: string; cartId: string | null; transactions: any[] }>>((groups, tx: any) => {
+    const noteCartId = typeof tx.note === 'string' && tx.note.startsWith(INVENTORY_CART_NOTE_PREFIX)
+      ? tx.note.slice(INVENTORY_CART_NOTE_PREFIX.length)
+      : null;
+    const cartId = String(tx.cartId || (tx.type === 'SALE' ? noteCartId : null) || '') || null;
+    const key = cartId ? `cart:${cartId}` : `transaction:${tx.id}`;
+    const group = groups.get(key) || { key, cartId, transactions: [] as any[] };
+    group.transactions.push(tx);
+    groups.set(key, group);
+    return groups;
+  }, new Map<string, { key: string; cartId: string | null; transactions: any[] }>()).values());
   const totalCollectedToday = collections.reduce((acc, c) => acc + c.amountCollected, 0);
 
   const filteredTransactions = transactions.filter(t => {
@@ -6338,7 +8042,7 @@ function CustomerAppContent() {
           )}
           {activeTab === 'home' && (
             <View>
-              {!isTravelBusiness && (
+              {!isTravelBusiness && !hasFeature('trips') && (
                 <View style={styles.homeBannerCard}>
                   <Text style={styles.homeBannerIcon}>{getBusinessIcon(user.businessType)}</Text>
                   <View style={{ flex: 1 }}>
@@ -6501,44 +8205,6 @@ function CustomerAppContent() {
                       </View>
                     )}
 
-                    {weatherStatus ? (
-                      <View style={{
-                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
-                        backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
-                      }}>
-                        <Text style={{ fontSize: 24 }}>{weatherStatus.icon}</Text>
-                        <View style={{ flex: 1 }}>
-                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
-                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{weatherStatus.label} · {weatherStatus.tempC}°C</Text>
-                        </View>
-                      </View>
-                    ) : weatherUnavailableReason === 'permission' ? (
-                      <Pressable
-                        onPress={() => Linking.openSettings()}
-                        style={{
-                          flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
-                          backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
-                        }}>
-                        <Text style={{ fontSize: 24 }}>📍</Text>
-                        <View style={{ flex: 1 }}>
-                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
-                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{t('drv_weatherPermissionNeeded')}</Text>
-                        </View>
-                        <Text style={{ fontSize: 18, color: colors.muted }}>›</Text>
-                      </Pressable>
-                    ) : weatherUnavailableReason === 'error' ? (
-                      <View style={{
-                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
-                        backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border,
-                      }}>
-                        <Text style={{ fontSize: 24 }}>⚠️</Text>
-                        <View style={{ flex: 1 }}>
-                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_weatherStatusTitle')}</Text>
-                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{t('drv_weatherUnavailable')}</Text>
-                        </View>
-                      </View>
-                    ) : null}
-
                     <View style={styles.seatMapCard}>
                       <Text style={styles.sectionHeading}>{t('drv_navigateTitle')}</Text>
                       <Text style={{ fontSize: 12, color: colors.muted, marginTop: 2, marginBottom: 10 }}>{t('drv_navigateHint')}</Text>
@@ -6669,8 +8335,153 @@ function CustomerAppContent() {
                 { icon: '📦', label: t('home_totalProducts'), value: String(inventory.length), color: colors.brand },
                 { icon: '📊', label: t('home_totalUnits'), value: String(totalInventoryItems), color: colors.blue },
                 { icon: '⚠️', label: t('home_lowStockItems'), value: String(lowStockCount), color: lowStockCount > 0 ? colors.red : colors.green },
-                { icon: '🧾', label: t('home_todaysSales'), value: `₹${(inventorySummary?.totalAmount || 0).toLocaleString()}`, color: colors.green },
+                { icon: '🧾', label: t('home_todaysSales'), value: `₹${(homeSnapshot?.today?.totalAmount ?? inventorySummary?.totalAmount ?? 0).toLocaleString()}`, color: colors.green },
               ])}
+
+              {(hasFeature('inventory') || hasFeature('products')) && (() => {
+                const openEntry = (type: 'SALE' | 'PURCHASE' | 'WASTAGE', item?: InventoryItem) => handleOpenRecordSale(item, type);
+                const owing = customers.filter((c: any) => c.totalDue > 0);
+                const toCollect = owing.reduce((sum: number, c: any) => sum + c.totalDue, 0);
+                const owed = vendors.filter((v: any) => v.totalDue > 0);
+                const toPay = owed.reduce((sum: number, v: any) => sum + v.totalDue, 0);
+                const profit = homeSnapshot?.today?.netProfit || 0;
+                const profitDiff = profit - (homeSnapshot?.yesterdayProfit || 0);
+                const bestSeller = homeSnapshot?.today?.byProduct?.[0];
+                const mostWasted = inventoryInsights?.topWastedProducts?.[0];
+                const trend = (inventoryInsights?.dailyTrend || []) as any[];
+                const trendMax = Math.max(...trend.map(d => d.amount), 1);
+                const lowItems = inventory.filter(i => i.stockQty <= i.lowStockThreshold).slice(0, 5);
+                return (
+                  <>
+                    <View style={styles.kpiRow}>
+                      <Pressable style={styles.kpiCard} onPress={() => setActiveTab('customers')}>
+                        <Text style={styles.kpiLabel}>{t('home_toCollect')}</Text>
+                        <Text style={[styles.kpiValue, styles.textPositive]}>₹{toCollect.toLocaleString()}</Text>
+                        <Text style={styles.kpiSub}>{t('home_fromCustomers', { count: owing.length })}</Text>
+                      </Pressable>
+                      <Pressable style={styles.kpiCard} onPress={() => setActiveTab('vendors')}>
+                        <Text style={styles.kpiLabel}>{t('home_toPay')}</Text>
+                        <Text style={[styles.kpiValue, styles.textNegative]}>₹{toPay.toLocaleString()}</Text>
+                        <Text style={styles.kpiSub}>{t('home_toVendors', { count: owed.length })}</Text>
+                      </Pressable>
+                    </View>
+
+                    <View style={styles.kpiRow}>
+                      <Pressable style={[styles.kpiCard, { flex: 1 }]} onPress={() => setActiveTab('daily_collection')}>
+                        <Text style={styles.kpiLabel}>{t('home_netProfitToday')}</Text>
+                        <Text style={[styles.kpiValue, profit >= 0 ? styles.textPositive : styles.textNegative]}>₹{profit.toLocaleString()}</Text>
+                        <Text style={styles.kpiSub}>
+                          {profitDiff >= 0 ? '▲' : '▼'} ₹{Math.abs(profitDiff).toLocaleString()} {t('home_vsYesterday')}
+                        </Text>
+                      </Pressable>
+                    </View>
+
+                    {owing.length > 0 && (
+                      <View style={[styles.chartCard, { marginBottom: 14 }]}>
+                        <View style={styles.chartCardHeaderRow}>
+                          <Text style={styles.chartCardTitle}>🔴 {t('home_topPending')}</Text>
+                          <Pressable onPress={() => setActiveTab('customers')} hitSlop={8}>
+                            <Text style={{ fontSize: 12, fontWeight: '700', color: colors.brand }}>{t('drv_viewAll')}</Text>
+                          </Pressable>
+                        </View>
+                        {owing.slice(0, 3).map((c: any, idx: number) => (
+                          <View key={c.customerName} style={{
+                            flexDirection: 'row', alignItems: 'center', paddingVertical: 8,
+                            borderTopWidth: idx === 0 ? 0 : 1, borderTopColor: colors.border,
+                          }}>
+                            <Pressable style={{ flex: 1, paddingRight: 8 }} onPress={() => handleOpenCustomerLedger(c.customerName)}>
+                              <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{c.customerName}</Text>
+                            </Pressable>
+                            <Text style={{ fontSize: 14, fontWeight: '800', color: colors.red, marginRight: 10 }}>₹{c.totalDue.toLocaleString()}</Text>
+                            <Pressable
+                              onPress={() => handleRemindCustomerFromHome(c.customerName)}
+                              style={{ backgroundColor: '#25D366', borderRadius: 8, paddingVertical: 7, paddingHorizontal: 12 }}>
+                              <Text style={{ color: '#fff', fontSize: 12, fontWeight: '700' }}>💬 {t('home_remind')}</Text>
+                            </Pressable>
+                          </View>
+                        ))}
+                      </View>
+                    )}
+
+                    {trend.length > 0 && (
+                      <Pressable style={[styles.chartCard, { marginBottom: 14 }]} onPress={() => setActiveTab('inventory_insights')}>
+                        <View style={styles.chartCardHeaderRow}>
+                          <Text style={styles.chartCardTitle}>📅 {t('home_salesTrend')}</Text>
+                          <Text style={styles.chartCardBadge}>{t('ins_last7Days')}</Text>
+                        </View>
+                        <View style={{ flexDirection: 'row', alignItems: 'flex-end', height: 110 }}>
+                          {trend.map((d, i) => {
+                            const isLast = i === trend.length - 1;
+                            return (
+                              <View key={d.date} style={{ flex: 1, alignItems: 'center', justifyContent: 'flex-end', height: '100%' }}>
+                                {d.amount > 0 && (
+                                  <Text style={styles.barValueChip} numberOfLines={1}>
+                                    {d.amount >= 1000 ? `${(d.amount / 1000).toFixed(1)}k` : Math.round(d.amount)}
+                                  </Text>
+                                )}
+                                <View
+                                  style={[
+                                    styles.barPill,
+                                    {
+                                      height: Math.max((d.amount / trendMax) * 76, d.amount > 0 ? 8 : 3),
+                                      backgroundColor: isLast ? colors.brand : '#818CF8',
+                                      opacity: isLast ? 1 : 0.55,
+                                    },
+                                  ]}>
+                                  <View style={styles.barPillSheen} />
+                                </View>
+                              </View>
+                            );
+                          })}
+                        </View>
+                        <View style={styles.chartBaseline} />
+                        <View style={{ flexDirection: 'row' }}>
+                          {trend.map((d, i) => (
+                            <View key={d.date} style={{ flex: 1, alignItems: 'center' }}>
+                              <Text style={[styles.barLabel, i === trend.length - 1 && styles.barLabelActive]} numberOfLines={1}>{d.label}</Text>
+                            </View>
+                          ))}
+                        </View>
+                      </Pressable>
+                    )}
+
+                    <View style={styles.kpiRow}>
+                      <View style={styles.kpiCard}>
+                        <Text style={styles.kpiLabel}>🏆 {t('home_bestSeller')}</Text>
+                        <Text style={[styles.kpiValue, { color: colors.brand }]} numberOfLines={1}>{bestSeller ? bestSeller.productName : '—'}</Text>
+                        <Text style={styles.kpiSub}>{bestSeller ? `₹${bestSeller.amount.toLocaleString()} · ${t('common_today')}` : t('home_noSalesToday')}</Text>
+                      </View>
+                      <View style={styles.kpiCard}>
+                        <Text style={styles.kpiLabel}>🗑️ {t('home_mostWasted')}</Text>
+                        <Text style={[styles.kpiValue, styles.textNegative]} numberOfLines={1}>{mostWasted ? mostWasted.productName : '—'}</Text>
+                        <Text style={styles.kpiSub}>{mostWasted ? `₹${mostWasted.amount.toLocaleString()} · ${t('home_last30Days')}` : t('home_noWastage')}</Text>
+                      </View>
+                    </View>
+
+                    {lowItems.length > 0 && (
+                      <View style={[styles.chartCard, { marginBottom: 14 }]}>
+                        <Text style={styles.chartCardTitle}>⚠️ {t('home_lowStockItems')}</Text>
+                        {lowItems.map((item, idx) => (
+                          <View key={item.id} style={{
+                            flexDirection: 'row', alignItems: 'center', paddingVertical: 8, marginTop: idx === 0 ? 6 : 0,
+                            borderTopWidth: idx === 0 ? 0 : 1, borderTopColor: colors.border,
+                          }}>
+                            <View style={{ flex: 1, paddingRight: 8 }}>
+                              <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{item.name}</Text>
+                              <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }}>{t('home_stockLeft', { qty: item.stockQty, unit: item.unit })}</Text>
+                            </View>
+                            <Pressable
+                              onPress={() => openEntry('PURCHASE', item)}
+                              style={{ backgroundColor: '#D97706', borderRadius: 8, paddingVertical: 7, paddingHorizontal: 12 }}>
+                              <Text style={{ color: '#fff', fontSize: 12, fontWeight: '700' }}>📥 {t('home_buy')}</Text>
+                            </Pressable>
+                          </View>
+                        ))}
+                      </View>
+                    )}
+                  </>
+                );
+              })()}
 
               {isBuildingBusiness && (() => {
                 const todayISO = formatDateISO(new Date());
@@ -6695,6 +8506,12 @@ function CustomerAppContent() {
                       <Text style={styles.homeQuickActionLabel} numberOfLines={2}>{tab.label}</Text>
                     </Pressable>
                   ))}
+                {!isTravelBusiness && hasFeature('trips') && (
+                  <Pressable onPress={() => setShowDaySummary(true)} style={styles.homeQuickActionCard}>
+                    <Text style={styles.homeQuickActionIcon}>📋</Text>
+                    <Text style={styles.homeQuickActionLabel} numberOfLines={2}>{t('drv_sumTitle')}</Text>
+                  </Pressable>
+                )}
               </View>
             </View>
           )}
@@ -7476,9 +9293,9 @@ function CustomerAppContent() {
               {/* Driver's own UPI QR (passengers scan it to pay) */}
               <View style={{ backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border, borderRadius: 14, padding: 12, marginBottom: 14 }}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                  <Pressable onPress={() => (driverQr ? setShowQrModal(true) : handlePickQr())}>
-                    {driverQr ? (
-                      <Image source={{ uri: driverQr }} style={{ width: 64, height: 64, borderRadius: 8, backgroundColor: '#fff' }} resizeMode="contain" />
+                  <Pressable onPress={() => (shownDriverQr ? setShowQrModal(true) : handlePickQr())}>
+                    {shownDriverQr ? (
+                      <Image source={{ uri: shownDriverQr }} style={{ width: 64, height: 64, borderRadius: 8, backgroundColor: '#fff' }} resizeMode={merchantQrUrl ? 'cover' : 'contain'} />
                     ) : (
                       <View style={{ width: 64, height: 64, borderRadius: 8, borderWidth: 1.5, borderStyle: 'dashed', borderColor: colors.brand, alignItems: 'center', justifyContent: 'center', backgroundColor: '#EEF2FF' }}>
                         <Text style={{ fontSize: 22 }}>📷</Text>
@@ -7488,9 +9305,33 @@ function CustomerAppContent() {
                   <View style={{ flex: 1 }}>
                     <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_upiQrTitle')}</Text>
                     <Text style={{ fontSize: 11, color: colors.muted, marginTop: 2 }}>
-                      {driverQr ? t('drv_tapToEnlarge') : t('drv_uploadQrHint')}
+                      {shownDriverQr ? t('drv_tapToEnlarge') : t('drv_uploadQrHint')}
                     </Text>
                   </View>
+                  {/* Merchant account action: tap to update keys; hover or long-press shows what it does */}
+                  {merchantCanUpdateKeys && (
+                    <View style={{ alignSelf: 'flex-start', alignItems: 'flex-end', zIndex: 2 }}>
+                      <Pressable
+                        onPress={() => merchantPanelRef.current?.openKeysForm()}
+                        onLongPress={() => {
+                          setShowKeysTip(true);
+                          setTimeout(() => setShowKeysTip(false), 2000);
+                        }}
+                        onHoverIn={() => setShowKeysTip(true)}
+                        onHoverOut={() => setShowKeysTip(false)}
+                        accessibilityRole="button"
+                        accessibilityLabel={t('drv_mchUpdateKeys')}
+                        hitSlop={8}
+                        style={{ width: 30, height: 30, borderRadius: 15, backgroundColor: colors.brandBg, alignItems: 'center', justifyContent: 'center' }}>
+                        <Text style={{ fontSize: 14 }}>✏️</Text>
+                      </Pressable>
+                      {showKeysTip && (
+                        <View style={{ position: 'absolute', top: 34, right: 0, backgroundColor: colors.navy, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4 }}>
+                          <Text numberOfLines={1} style={{ color: '#fff', fontSize: 11, fontWeight: '600' }}>{t('drv_mchUpdateKeys')}</Text>
+                        </View>
+                      )}
+                    </View>
+                  )}
                 </View>
                 <View style={{ flexDirection: 'row', gap: 8, marginTop: 12 }}>
                   <Pressable
@@ -7530,8 +9371,49 @@ function CustomerAppContent() {
                     {voiceRecorderState.isRecording ? t('drv_voiceListeningHint') : t('drv_voiceProcessingHint')}
                   </Text>
                 )}
+                {hasFeature('fuel') && (
+                  <Pressable
+                    onPress={handleOpenQuickFuel}
+                    style={{
+                      marginTop: 8, backgroundColor: colors.amberBg, borderWidth: 1, borderColor: colors.amberBorder,
+                      borderRadius: 8, paddingVertical: 9, alignItems: 'center', justifyContent: 'center',
+                    }}>
+                    <Text style={{ color: colors.amber, fontSize: 12, fontWeight: '700' }}>⛽ {t('drv_fuelQuickTitle')}</Text>
+                  </Pressable>
+                )}
               </View>
 
+              {/* Merchant account: gateway-issued QR whose payments are recorded automatically */}
+              {user?.id && (
+                <DriverMerchantPanel
+                  ownerId={user.id}
+                  userName={user.fullName}
+                  userEmail={user.email}
+                  apiFetch={apiFetch}
+                  t={t}
+                  onPaymentsChanged={loadDriverTrips}
+                  ref={merchantPanelRef}
+                  compactWhenActive
+                  hidePaymentsGrid
+                  onQrChange={(url, canUpdateKeys, testMode) => {
+                    setMerchantQrUrl(url);
+                    setMerchantCanUpdateKeys(canUpdateKeys);
+                    setMerchantTestMode(testMode);
+                  }}
+                />
+              )}
+
+              {/* On duty: GPS distance tracking */}
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border, borderRadius: 14, paddingVertical: 8, paddingHorizontal: 12, marginBottom: 14 }}>
+                <Text style={{ fontSize: 16 }}>{duty.onDuty ? '🟢' : '⚪'}</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_dutyOn')}</Text>
+                  <Text style={{ fontSize: 11, color: duty.permissionDenied ? colors.red : colors.muted, marginTop: 1 }}>
+                    {duty.permissionDenied ? t('drv_dutyNoPermission') : t('drv_dutyHint')}
+                  </Text>
+                </View>
+                <Switch value={duty.onDuty} onValueChange={duty.toggleDuty} />
+              </View>
 
               {/* Trips KPI Summary */}
               <View style={styles.kpiRow}>
@@ -7543,56 +9425,138 @@ function CustomerAppContent() {
                 <View style={styles.kpiCard}>
                   <Text style={styles.kpiLabel}>{t('trip_distance')}</Text>
                   <Text style={[styles.kpiValue, { color: colors.brand }]}>{totalTripDistance} km</Text>
-                  <Text style={styles.kpiSub}>{t('trip_totalLogged')}</Text>
+                  <Text style={styles.kpiSub}>
+                    {totalTripDistance > 0 && totalFuelCost > 0
+                      ? t('drv_distFuelPerKm', { amount: Math.round((totalFuelCost / totalTripDistance) * 10) / 10 })
+                      : t('trip_totalLogged')}
+                  </Text>
                 </View>
                 <View style={styles.kpiCard}>
                   <Text style={styles.kpiLabel}>{t('trip_fareEarned')}</Text>
-                  <Text style={[styles.kpiValue, styles.textPositive]}>₹{totalTripEarnings}</Text>
-                  <Text style={styles.kpiSub}>{t('trip_netEarnings')}</Text>
+                  <Text style={[styles.kpiValue, totalTripEarnings - totalFuelCost < 0 ? styles.textNegative : styles.textPositive]}>
+                    {totalTripEarnings - totalFuelCost < 0 ? '-' : ''}₹{Math.abs(totalTripEarnings - totalFuelCost)}
+                  </Text>
+                  <Text style={styles.kpiSub}>
+                    {totalFuelCost > 0 ? t('trip_afterFuel', { amount: totalFuelCost.toLocaleString() }) : t('trip_netEarnings')}
+                  </Text>
                 </View>
               </View>
 
-              <Text style={styles.sectionHeading}>{t('trip_loggedTrips', { count: trips.length })}</Text>
-
-              {trips.map(trip => (
-                <Pressable key={trip.id} onLongPress={() => handleDeleteTrip(trip)} style={styles.tripCard}>
-                  <View style={styles.tripLeftCol}>
-                    <View style={styles.tripRouteRow}>
-                      <Text style={styles.tripRoutePin}>📍</Text>
-                      <Text style={styles.tripRouteText}>
-                        {trip.route || trip.locationName || t('drv_locationUnavailable')}
-                      </Text>
+              {/* Payments: every payment recorded today - cash, manual UPI and automatic QR - in one grid */}
+              <View style={{ backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border, borderRadius: 14, padding: 12, marginBottom: 14 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_payGridTitle', { count: trips.length + fuelLogs.length })}</Text>
+                  {!!merchantQrUrl && (
+                    <Pressable
+                      onPress={handleTogglePaySound}
+                      accessibilityRole="switch"
+                      accessibilityState={{ checked: paySoundOn }}
+                      accessibilityLabel={t('drv_paySoundLabel')}
+                      hitSlop={8}
+                      style={{ marginLeft: 'auto', marginRight: merchantTestMode ? 8 : 0 }}>
+                      <Text style={{ fontSize: 16, opacity: paySoundOn ? 1 : 0.45 }}>{paySoundOn ? '🔊' : '🔇'}</Text>
+                    </Pressable>
+                  )}
+                  {merchantTestMode && (
+                    <Pressable onPress={() => merchantPanelRef.current?.addTestPayment()} style={{ backgroundColor: colors.amberBg, paddingHorizontal: 8, paddingVertical: 2, borderRadius: 6 }}>
+                      <Text style={{ fontSize: 10, fontWeight: '700', color: colors.amber }}>{t('drv_mchTestBtn')}</Text>
+                    </Pressable>
+                  )}
+                </View>
+                {trips.length + fuelLogs.length === 0 ? (
+                  <Text style={{ fontSize: 11, color: colors.muted, marginTop: 8 }}>{t('drv_payGridEmpty')}</Text>
+                ) : (
+                  <View style={{ marginTop: 8 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, paddingHorizontal: 4, backgroundColor: colors.page, borderRadius: 6 }}>
+                      <Text style={[styles.payGridHead, { width: 58 }]}>{t('drv_mchColTime')}</Text>
+                      <Text style={[styles.payGridHead, { flex: 1 }]}>{t('drv_mchColPayer')}</Text>
+                      <Text style={[styles.payGridHead, { width: 62, textAlign: 'right' }]}>{t('drv_mchColAmount')}</Text>
+                      <Text style={[styles.payGridHead, { width: 72, textAlign: 'right' }]}>{t('drv_payColMode')}</Text>
                     </View>
-                    <View style={styles.tripMetricsRow}>
-                      {trip.distanceKm > 0 && (
-                        <>
-                          <Text style={styles.tripMetricText}>
-                            {trip.startKm} → {trip.endKm} km ({trip.distanceKm} km ride)
-                          </Text>
-                          <Text style={styles.bulletDot}>•</Text>
-                        </>
-                      )}
-                      <Text style={styles.tripTimeText}>{trip.time}</Text>
-                    </View>
+                    {[
+                      ...trips.map(trip => ({ at: trip.tripTimeMs, trip, fuel: null as FuelLog | null })),
+                      ...fuelLogs.map(fuel => ({ at: fuel.fuelTimeMs, trip: null as DriverTrip | null, fuel })),
+                    ].sort((a, b) => b.at - a.at).map(({ trip, fuel }) => {
+                      if (fuel) {
+                        // Fuel expense: money out, shown in red among the day's payments
+                        return (
+                          <View
+                            key={`fuel-${fuel.id}`}
+                            style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                            <Text style={[styles.payGridCell, { width: 58 }]}>
+                              {new Date(fuel.fuelTimeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </Text>
+                            <View style={{ flex: 1 }}>
+                              <Text style={styles.payGridCell} numberOfLines={1}>⛽ {t('drv_fuelRowTitle', { type: fuel.fuelType })}</Text>
+                              {(fuel.quantity > 0 || !!fuel.station) && (
+                                <Text style={styles.payGridSub} numberOfLines={1}>
+                                  {[fuel.quantity > 0 ? `${fuel.quantity} ${fuel.fuelType === 'CNG' ? 'Kg' : 'L'}` : '', fuel.station].filter(Boolean).join(' · ')}
+                                </Text>
+                              )}
+                            </View>
+                            <Text style={[styles.payGridCell, { width: 62, textAlign: 'right', color: colors.red, fontWeight: '800' }]}>-₹{fuel.totalCost.toLocaleString()}</Text>
+                            <View style={{ width: 72, alignItems: 'flex-end' }}>
+                              <View style={[styles.modeBadge, { marginTop: 0, backgroundColor: colors.amberBg }]}>
+                                <Text style={[styles.modeBadgeText, { color: colors.amber }]}>{t('drv_fuelBadge')}</Text>
+                              </View>
+                              <Text style={styles.payGridSub} numberOfLines={1}>{fuel.paymentMode}</Text>
+                            </View>
+                          </View>
+                        );
+                      }
+                      if (!trip) return null;
+                      const isCash = trip.paymentMode === 'Cash';
+                      const qr = trip.qr;
+                      // Under the badge: a refund, or (when the platform collects the money) where the payout stands.
+                      const qrNote = !qr
+                        ? ''
+                        : qr.refundedAmount > 0
+                        ? t('drv_mchRefunded', { amount: qr.refundedAmount.toLocaleString() })
+                        : qr.transferStatus === 'MANUAL'
+                        ? t('drv_mchTrfManual')
+                        : qr.transferStatus === 'CREATED'
+                        ? t('drv_mchTrfCreated')
+                        : qr.transferStatus === 'FAILED'
+                        ? t('drv_mchTrfFailed')
+                        : qr.transferStatus === 'DIRECT'
+                        ? ''
+                        : t('drv_mchTrfPending');
+                      const detail = qr
+                        ? t('drv_mchRef', { ref: qr.ref })
+                        : trip.distanceKm > 0
+                        ? `${trip.startKm} → ${trip.endKm} km`
+                        : trip.route
+                        ? trip.locationName
+                        : '';
+                      return (
+                        <Pressable
+                          key={trip.id}
+                          onLongPress={() => handleDeleteTrip(trip)}
+                          style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                          <Text style={[styles.payGridCell, { width: 58 }]}>{trip.time}</Text>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.payGridCell} numberOfLines={1}>
+                              {qr?.payerVpa || trip.route || trip.locationName || (isCash ? t('drv_payCashEntry') : t('drv_mchUnknownPayer'))}
+                            </Text>
+                            {!!detail && <Text style={styles.payGridSub} numberOfLines={1}>{detail}</Text>}
+                          </View>
+                          <Text style={[styles.payGridCell, { width: 62, textAlign: 'right', color: colors.green, fontWeight: '800' }]}>₹{trip.fare.toLocaleString()}</Text>
+                          <View style={{ width: 72, alignItems: 'flex-end' }}>
+                            <View style={[styles.modeBadge, { marginTop: 0 }, isCash ? styles.modeBadgeCash : styles.modeBadgeUpi]}>
+                              <Text style={[styles.modeBadgeText, isCash ? styles.modeBadgeTextCash : styles.modeBadgeTextUpi]}>{trip.paymentMode}</Text>
+                            </View>
+                            {!!qrNote && (
+                              <Text style={[styles.payGridSub, { color: qr && (qr.refundedAmount > 0 || qr.transferStatus === 'FAILED') ? colors.red : colors.amber }]} numberOfLines={1}>
+                                {qrNote}
+                              </Text>
+                            )}
+                          </View>
+                        </Pressable>
+                      );
+                    })}
                   </View>
-                  <View style={styles.tripRightCol}>
-                    <Text style={styles.tripFareText}>+₹{trip.fare}</Text>
-                    <View
-                      style={[
-                        styles.modeBadge,
-                        trip.paymentMode === 'UPI' ? styles.modeBadgeUpi : styles.modeBadgeCash,
-                      ]}>
-                      <Text
-                        style={[
-                          styles.modeBadgeText,
-                          trip.paymentMode === 'UPI' ? styles.modeBadgeTextUpi : styles.modeBadgeTextCash,
-                        ]}>
-                        {trip.paymentMode}
-                      </Text>
-                    </View>
-                  </View>
-                </Pressable>
-              ))}
+                )}
+              </View>
             </View>
           )}
 
@@ -7613,8 +9577,14 @@ function CustomerAppContent() {
                 </View>
                 <View style={styles.kpiCard}>
                   <Text style={styles.kpiLabel}>{t('fuel_avgRate')}</Text>
-                  <Text style={[styles.kpiValue, { color: colors.brand }]}>₹85/Kg</Text>
-                  <Text style={styles.kpiSub}>{t('fuel_cngRate')}</Text>
+                  <Text style={[styles.kpiValue, { color: colors.brand }]}>
+                    {(() => {
+                      const filled = fuelLogs.filter(f => f.quantity > 0 && f.rate > 0);
+                      const qty = filled.reduce((sum, f) => sum + f.quantity, 0);
+                      return qty > 0 ? `₹${Math.round((filled.reduce((sum, f) => sum + f.quantity * f.rate, 0) / qty) * 10) / 10}` : '—';
+                    })()}
+                  </Text>
+                  <Text style={styles.kpiSub}>{t('fuel_todayOnly')}</Text>
                 </View>
               </View>
 
@@ -7639,66 +9609,52 @@ function CustomerAppContent() {
               })()}
 
               <View style={styles.sectionHeaderRow}>
-                <Text style={styles.sectionHeading}>{t('fuel_fuelLogs', { count: fuelLogs.length })}</Text>
+                <Text style={[styles.sectionHeading, { flex: 1 }]}>{t('fuel_fuelLogs', { count: fuelLogsAll.length })}</Text>
                 <Pressable
-                  onPress={() => {
-                    setFuelOdometer(String(vehicle.totalKm));
-                    setFuelTotalOverride('');
-                    setFuelVoiceTranscript('');
-                    setFuelVoiceConfirmed(false);
-                    setShowAddFuelModal(true);
-                  }}
-                  style={styles.primaryPillBtn}>
-                  <Text style={styles.primaryPillBtnText}>{t('fuel_addFuelFill')}</Text>
+                  onPress={handleOpenQuickFuel}
+                  style={[styles.primaryPillBtn, { backgroundColor: colors.amberBg, borderWidth: 1, borderColor: colors.amberBorder }]}>
+                  <Text style={[styles.primaryPillBtnText, { color: colors.amber }]}>⚡ {t('drv_fuelQuickBtn')}</Text>
                 </Pressable>
               </View>
 
-              <Pressable
-                onPress={fuelVoiceProcessing ? undefined : (voiceRecorderState.isRecording ? handleStopFuelVoiceRecording : handleStartFuelVoiceRecording)}
-                disabled={fuelVoiceProcessing}
-                style={{
-                  flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
-                  backgroundColor: voiceRecorderState.isRecording ? colors.redBg : colors.brandBg,
-                  borderWidth: 1, borderColor: voiceRecorderState.isRecording ? colors.redBorder : '#C7D2FE',
-                  borderRadius: 10, paddingVertical: 10, marginBottom: 10,
-                  opacity: fuelVoiceProcessing ? 0.6 : 1,
-                }}>
-                <Text style={{ color: voiceRecorderState.isRecording ? colors.red : colors.brand, fontSize: 12, fontWeight: '700' }}>
-                  {fuelVoiceProcessing
-                    ? t('drv_voiceProcessing')
-                    : voiceRecorderState.isRecording
-                    ? t('drv_voiceStop')
-                    : t('fuel_speak')}
-                </Text>
-              </Pressable>
-              {(voiceRecorderState.isRecording || fuelVoiceProcessing) && (
-                <Text style={{ fontSize: 11, color: colors.muted, textAlign: 'center', marginBottom: 10 }}>
-                  {voiceRecorderState.isRecording ? t('drv_voiceListeningHintFuel') : t('drv_voiceProcessingHint')}
-                </Text>
-              )}
-
-              {fuelLogs.map(log => (
-                <View key={log.id} style={styles.fuelCard}>
-                  <View style={styles.fuelLeftCol}>
-                    <View style={styles.fuelStationRow}>
-                      <Text style={styles.fuelStationIcon}>⛽</Text>
-                      <Text style={styles.fuelStationName}>{log.station}</Text>
-                    </View>
-                    <Text style={styles.fuelDetailText}>
-                      {log.quantity > 0
-                        ? `${log.quantity} ${log.fuelType === 'CNG' ? 'Kg' : 'Litres'} @ ₹${log.rate}/${log.fuelType === 'CNG' ? 'Kg' : 'L'} • Odo: ${log.odometer} km`
-                        : `Odo: ${log.odometer} km`}
+              {(showAllFuelHistory ? fuelLogsAll : fuelLogsAll.slice(0, 5)).map(log => (
+                <View
+                  key={log.id}
+                  style={{
+                    flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.panel, borderWidth: 1,
+                    borderColor: colors.border, borderRadius: 10, paddingVertical: 8, paddingHorizontal: 10, marginBottom: 6,
+                  }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: colors.navy }} numberOfLines={1}>
+                      ⛽ {log.station || t('drv_fuelRowTitle', { type: log.fuelType })}
                     </Text>
-                    <Text style={styles.fuelDateText}>{log.date}</Text>
+                    <Text style={{ fontSize: 10, color: colors.muted, marginTop: 2 }} numberOfLines={1}>
+                      {[
+                        log.station ? log.fuelType : '',
+                        log.quantity > 0 ? `${log.quantity} ${log.fuelType === 'CNG' ? 'Kg' : 'L'} @ ₹${log.rate}` : '',
+                        log.paymentMode,
+                        log.date,
+                      ].filter(Boolean).join(' · ')}
+                    </Text>
                   </View>
-                  <View style={styles.fuelRightCol}>
-                    <Text style={styles.fuelAmountText}>-₹{log.totalCost}</Text>
-                    <View style={styles.fuelTypePill}>
-                      <Text style={styles.fuelTypePillText}>{log.fuelType}</Text>
-                    </View>
-                  </View>
+                  <Text style={{ fontSize: 13, fontWeight: '800', color: colors.red }}>-₹{log.totalCost.toLocaleString()}</Text>
+                  <Pressable
+                    onPress={() => handleDeleteFuelLog(log)}
+                    accessibilityRole="button"
+                    accessibilityLabel={t('drv_fuelDeleteTitle')}
+                    hitSlop={8}
+                    style={{ width: 28, height: 28, borderRadius: 14, backgroundColor: colors.redBg, alignItems: 'center', justifyContent: 'center' }}>
+                    <Text style={{ fontSize: 13 }}>🗑️</Text>
+                  </Pressable>
                 </View>
               ))}
+              {fuelLogsAll.length > 5 && (
+                <Pressable onPress={() => setShowAllFuelHistory(v => !v)} style={[styles.actionBtnOutline, { marginTop: 4 }]}>
+                  <Text style={styles.actionBtnOutlineText}>
+                    {showAllFuelHistory ? t('fuel_showLess') : t('fuel_viewHistory', { count: fuelLogsAll.length })}
+                  </Text>
+                </Pressable>
+              )}
             </View>
           )}
 
@@ -8110,112 +10066,505 @@ function CustomerAppContent() {
           {/* Business Feature Tab: Inventory / Products (Fruit/Vegetable & Retailer) */}
           {activeTab === 'inventory' && (hasFeature('inventory') || hasFeature('products')) && (
             <View>
-              {/* Inventory KPI Summary */}
-              <View style={styles.kpiRow}>
-                <View style={styles.kpiCard}>
-                  <Text style={styles.kpiLabel}>{t('inv_totalProducts')}</Text>
-                  <Text style={styles.kpiValue}>{inventory.length}</Text>
-                  <Text style={styles.kpiSub}>{t('inv_catalogItems')}</Text>
-                </View>
-                <View style={styles.kpiCard}>
-                  <Text style={styles.kpiLabel}>{t('inv_totalUnits')}</Text>
-                  <Text style={[styles.kpiValue, { color: colors.brand }]}>{totalInventoryItems}</Text>
-                  <Text style={styles.kpiSub}>{t('inv_inStock')}</Text>
-                </View>
-                <View style={styles.kpiCard}>
-                  <Text style={styles.kpiLabel}>{t('inv_lowStock')}</Text>
-                  <Text style={[styles.kpiValue, lowStockCount > 0 ? styles.textNegative : styles.textPositive]}>
-                    {lowStockCount}
-                  </Text>
-                  <Text style={styles.kpiSub}>{t('inv_needReorder')}</Text>
+              <View style={styles.sectionHeaderRow}>
+                <Text style={[styles.sectionHeading, { flex: 1 }]} numberOfLines={1}>{t('inv_catalogHeading')}</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={t('inv_cartTitle')}
+                    onPress={() => setShowInventoryCartModal(true)}
+                    style={{ width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 10, borderWidth: 1, borderColor: colors.border, backgroundColor: '#FFFFFF' }}>
+                    <Text style={{ fontSize: 20 }}>🛒</Text>
+                    {selectedInventoryCount > 0 && (
+                      <View style={{ position: 'absolute', top: -5, right: -5, minWidth: 18, height: 18, paddingHorizontal: 4, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: colors.red }}>
+                        <Text style={{ color: '#FFFFFF', fontSize: 10, fontWeight: '800' }}>{selectedInventoryCount}</Text>
+                      </View>
+                    )}
+                  </Pressable>
+                  <Pressable
+                    onPress={() => {
+                      setInventoryVoiceTranscript('');
+                      setInventoryVoiceConfirmed(false);
+                      setShowAddProductModal(true);
+                    }}
+                    style={styles.primaryPillBtn}>
+                    <Text style={styles.primaryPillBtnText}>{t('inv_addItem')}</Text>
+                  </Pressable>
                 </View>
               </View>
 
-              <View style={styles.sectionHeaderRow}>
-                <Text style={styles.sectionHeading}>{t('inv_catalogHeading')}</Text>
+              {!!dailyRates?.length && (() => {
+                const pendingCount = dailyRates.filter(rate => !rate.setToday).length;
+                const isPending = pendingCount > 0;
+                return (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, borderWidth: 1, borderColor: isPending ? colors.amberBorder : colors.greenBorder, borderRadius: 9, backgroundColor: isPending ? colors.amberBg : colors.greenBg, paddingHorizontal: 11, paddingVertical: 8, marginBottom: 10 }}>
+                    <Text style={{ flex: 1, fontSize: 12, fontWeight: '700', color: isPending ? colors.amber : colors.greenDark }}>
+                      {isPending ? t('rate_pending', { count: pendingCount }) : t('rate_allSet')}
+                    </Text>
+                    <Pressable accessibilityRole="button" accessibilityLabel={t('rate_title')} onPress={handleOpenDailyRates} style={styles.primaryPillBtn}>
+                      <Text style={styles.primaryPillBtnText}>{isPending ? t('rate_setBtn') : t('common_edit')}</Text>
+                    </Pressable>
+                  </View>
+                );
+              })()}
+
+              <Modal visible={showDailyRatesModal} animationType="slide" transparent onRequestClose={() => setShowDailyRatesModal(false)}>
+                <View style={styles.modalOverlay}>
+                  <View style={styles.modalContent}>
+                    <View style={styles.modalHeaderRow}>
+                      <Text style={styles.modalHeading}>🏷️ {t('rate_title')}</Text>
+                      <Pressable onPress={() => setShowDailyRatesModal(false)}>
+                        <Text style={styles.modalCloseText}>✕</Text>
+                      </Pressable>
+                    </View>
+                    <Text style={{ fontSize: 11, color: colors.muted, marginBottom: 6 }}>{t('rate_hint')}</Text>
+                    <ScrollView style={{ maxHeight: 420 }} keyboardShouldPersistTaps="handled">
+                      {(dailyRates || []).map(rate => {
+                        const entered = Number(dailyRateInputs[rate.productId]);
+                        const margin = entered > 0 && rate.costPrice > 0 ? entered - rate.costPrice : null;
+                        return (
+                          <View key={rate.productId} style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                            <View style={{ flex: 1, minWidth: 0 }}>
+                              <Text style={{ fontSize: 14, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{rate.productName}</Text>
+                              <Text style={{ fontSize: 10, color: colors.muted, marginTop: 3 }}>
+                                {t('rate_cost', { cost: rate.costPrice })}
+                                {rate.previousPrice != null ? ` • ${t('rate_previous', { price: rate.previousPrice, date: formatDisplayDate(rate.previousDate) })}` : ''}
+                              </Text>
+                              {margin != null && (
+                                <Text style={{ fontSize: 10, fontWeight: '700', color: margin < 0 ? colors.red : colors.greenDark, marginTop: 2 }}>
+                                  {t('rate_profit', { margin: `${margin < 0 ? '−' : ''}₹${Number(Math.abs(margin).toFixed(2))}`, unit: rate.unit })}
+                                </Text>
+                              )}
+                            </View>
+                            <Text style={{ fontSize: 14, fontWeight: '700', color: colors.slate }}>₹</Text>
+                            <TextInput
+                              accessibilityLabel={rate.productName}
+                              keyboardType="decimal-pad"
+                              selectTextOnFocus
+                              value={dailyRateInputs[rate.productId] ?? ''}
+                              onChangeText={value => setDailyRateInputs(previous => ({ ...previous, [rate.productId]: value.replace(/[^0-9.]/g, '') }))}
+                              style={{ width: 80, height: 40, paddingHorizontal: 8, paddingVertical: 0, borderWidth: 1, borderColor: colors.border, borderRadius: 8, textAlign: 'center', color: colors.navy, fontSize: 15, fontWeight: '700' }}
+                            />
+                            <Text style={{ width: 34, fontSize: 11, color: colors.muted }} numberOfLines={1}>/{rate.unit}</Text>
+                          </View>
+                        );
+                      })}
+                    </ScrollView>
+                    <Pressable
+                      onPress={handleSaveDailyRates}
+                      disabled={dailyRatesSaving}
+                      style={[styles.modalSubmitBtn, { marginTop: 12 }, dailyRatesSaving && { opacity: 0.6 }]}>
+                      <Text style={styles.modalSubmitBtnText}>{dailyRatesSaving ? t('common_saving') : t('rate_save')}</Text>
+                    </Pressable>
+                    <Pressable onPress={handleShareDailyRates} style={{ alignItems: 'center', paddingVertical: 12 }}>
+                      <Text style={{ fontSize: 13, fontWeight: '700', color: colors.brand }}>📤 {t('rate_share')}</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              </Modal>
+
+              <View style={{ flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: colors.border, borderRadius: 9, backgroundColor: '#FFFFFF', paddingHorizontal: 11, marginBottom: 10 }}>
+                <Text style={{ fontSize: 16, color: colors.muted, marginRight: 8 }}>⌕</Text>
+                <TextInput
+                  accessibilityLabel={t('inv_searchProducts')}
+                  value={inventorySearchQuery}
+                  onChangeText={setInventorySearchQuery}
+                  placeholder={t('inv_searchProducts')}
+                  placeholderTextColor={colors.muted}
+                  returnKeyType="search"
+                  style={{ flex: 1, minHeight: 42, paddingVertical: 0, color: colors.navy, fontSize: 13 }}
+                />
+                {!!inventorySearchQuery && (
+                  <Pressable accessibilityRole="button" accessibilityLabel={t('inv_clearSearch')} onPress={() => setInventorySearchQuery('')} hitSlop={8}>
+                    <Text style={{ fontSize: 17, color: colors.muted, paddingHorizontal: 4 }}>×</Text>
+                  </Pressable>
+                )}
                 <Pressable
-                  onPress={() => {
-                    setInventoryVoiceTranscript('');
-                    setInventoryVoiceConfirmed(false);
-                    setShowAddProductModal(true);
-                  }}
-                  style={styles.primaryPillBtn}>
-                  <Text style={styles.primaryPillBtnText}>{t('inv_addItem')}</Text>
+                  accessibilityRole="button"
+                  accessibilityLabel={inventorySearchVoiceProcessing ? t('inv_searchProcessing') : voiceRecorderState.isRecording ? t('drv_voiceStop') : t('inv_searchVoice')}
+                  onPress={inventorySearchVoiceProcessing ? undefined : voiceRecorderState.isRecording ? handleStopInventorySearchRecording : handleStartInventorySearchRecording}
+                  disabled={inventorySearchVoiceProcessing}
+                  style={{ width: 34, height: 36, alignItems: 'center', justifyContent: 'center', marginLeft: 4, borderRadius: 7, backgroundColor: voiceRecorderState.isRecording ? colors.redBg : 'transparent', opacity: inventorySearchVoiceProcessing ? 0.6 : 1 }}>
+                  {inventorySearchVoiceProcessing
+                    ? <ActivityIndicator size="small" color={colors.brand} />
+                    : <Text style={{ fontSize: 17, color: voiceRecorderState.isRecording ? colors.red : colors.brand }}>{voiceRecorderState.isRecording ? '■' : '🎙️'}</Text>}
                 </Pressable>
               </View>
-
-              <Pressable
-                onPress={inventoryVoiceProcessing ? undefined : (voiceRecorderState.isRecording ? handleStopInventoryVoiceRecording : handleStartInventoryVoiceRecording)}
-                disabled={inventoryVoiceProcessing}
-                style={{
-                  flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
-                  backgroundColor: voiceRecorderState.isRecording ? colors.redBg : colors.brandBg,
-                  borderWidth: 1, borderColor: voiceRecorderState.isRecording ? colors.redBorder : '#C7D2FE',
-                  borderRadius: 10, paddingVertical: 10, marginBottom: 10,
-                  opacity: inventoryVoiceProcessing ? 0.6 : 1,
-                }}>
-                <Text style={{ color: voiceRecorderState.isRecording ? colors.red : colors.brand, fontSize: 12, fontWeight: '700' }}>
-                  {inventoryVoiceProcessing
-                    ? t('drv_voiceProcessing')
-                    : voiceRecorderState.isRecording
-                    ? t('drv_voiceStop')
-                    : t('inv_voiceAgentBtn')}
-                </Text>
-              </Pressable>
-              {(voiceRecorderState.isRecording || inventoryVoiceProcessing) && (
+              {(voiceRecorderState.isRecording || inventorySearchVoiceProcessing) && (
                 <Text style={{ fontSize: 11, color: colors.muted, textAlign: 'center', marginBottom: 10 }}>
-                  {voiceRecorderState.isRecording ? t('inv_voiceListeningHintAgent') : t('drv_voiceProcessingHint')}
+                  {voiceRecorderState.isRecording ? t('inv_searchListening') : t('inv_searchProcessing')}
                 </Text>
               )}
 
               {inventory.length === 0 && !inventoryLoading && (
                 <Text style={styles.emptyStateText}>{t('inv_emptyState')}</Text>
               )}
+              {inventory.length > 0 && filteredInventory.length === 0 && (
+                <Text style={styles.emptyStateText}>{t('inv_noSearchResults')}</Text>
+              )}
 
-              {inventory.map(item => {
-                const isLow = item.stockQty <= item.lowStockThreshold;
-                return (
-                  <View key={item.id} style={styles.inventoryCard}>
-                    <View style={{ flex: 1 }}>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                        <Text style={styles.invItemName}>{item.name}</Text>
-                        <View style={styles.invCategoryPill}>
-                          <Text style={styles.invCategoryText}>{item.category}</Text>
-                        </View>
+              {filteredInventory.length > 0 && (
+                <View style={{ marginBottom: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 8, overflow: 'hidden', backgroundColor: '#FFFFFF' }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 10, paddingVertical: 8, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                    <Pressable
+                      accessibilityRole="checkbox"
+                      accessibilityState={{ checked: allInventorySelected }}
+                      accessibilityLabel={t('inv_selectAllProducts')}
+                      onPress={toggleAllInventoryCartItems}
+                      disabled={visibleCartableInventory.length === 0}
+                      style={{ flexDirection: 'row', alignItems: 'center', gap: 7, opacity: visibleCartableInventory.length === 0 ? 0.5 : 1 }}>
+                      <View style={{ width: 20, height: 20, alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1.5, borderColor: allInventorySelected ? colors.brand : '#94A3B8', backgroundColor: allInventorySelected ? colors.brand : '#FFFFFF' }}>
+                        {allInventorySelected && <Text style={{ color: '#FFFFFF', fontSize: 14, lineHeight: 16, fontWeight: '800' }}>✓</Text>}
                       </View>
-                      <Text style={styles.invPriceText}>
-                        {t('inv_sellingPrice')} <Text style={{ fontWeight: '700', color: colors.navy }}>₹{item.sellingPrice}/{item.unit}</Text>
-                      </Text>
-                    </View>
-                    <View style={{ alignItems: 'flex-end', gap: 6 }}>
-                      <View style={[styles.stockBadge, isLow ? styles.stockBadgeLow : styles.stockBadgeOk]}>
-                        <Text style={[styles.stockBadgeText, isLow ? styles.stockBadgeTextLow : styles.stockBadgeTextOk]}>
-                          {isLow ? `${t('inv_low')} ${item.stockQty} ${item.unit}` : `${item.stockQty} ${item.unit}`}
-                        </Text>
-                      </View>
-                      <View style={{ flexDirection: 'row', gap: 6 }}>
-                        {isLow && (
+                      <Text style={{ fontSize: 10, fontWeight: '700', color: colors.slate }}>{t('inv_selectAllProducts')}</Text>
+                    </Pressable>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={{ fontSize: 10, color: colors.muted }}>{t('inv_selectedCount', { count: selectedInventoryCount })}</Text>
+                      {selectedInventoryCount > 0 && (
+                        <>
+                          {selectedInventoryCount === 1 && (
+                            <Pressable
+                              accessibilityRole="button"
+                              accessibilityLabel={t('inv_editProductTitle')}
+                              onPress={() => handleOpenEditProduct(inventoryCartItems[0])}
+                              style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#C7D2FE', borderRadius: 6, backgroundColor: colors.brandBg }}>
+                              <Text style={{ fontSize: 12 }}>✏️</Text>
+                            </Pressable>
+                          )}
                           <Pressable
-                            onPress={() => handleOpenEditStock(item)}
-                            style={{ alignItems: 'center', justifyContent: 'center', backgroundColor: '#FFFBEB', borderColor: '#FDE68A', borderWidth: 1, width: 30, height: 30, borderRadius: 6 }}>
-                            <Text style={{ fontSize: 13 }}>✏️</Text>
+                            accessibilityRole="button"
+                            accessibilityLabel={t('inv_deleteSelectedProducts')}
+                            onPress={handleDeleteSelectedProducts}
+                            disabled={deleteSelectedLoading}
+                            style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: colors.redBorder, borderRadius: 6, backgroundColor: colors.redBg, opacity: deleteSelectedLoading ? 0.5 : 1 }}>
+                            <Text style={{ fontSize: 12 }}>🗑️</Text>
                           </Pressable>
-                        )}
-                        <Pressable
-                          onPress={() => handleOpenRecordSale(item)}
-                          style={{ alignItems: 'center', justifyContent: 'center', backgroundColor: '#ECFDF5', borderColor: '#A7F3D0', borderWidth: 1, width: 30, height: 30, borderRadius: 6 }}>
-                          <Text style={{ fontSize: 15 }}>➕</Text>
-                        </Pressable>
-                        <Pressable
-                          onPress={() => handleDeleteProduct(item)}
-                          style={{ alignItems: 'center', justifyContent: 'center', backgroundColor: '#FEF2F2', borderColor: '#FECACA', borderWidth: 1, width: 30, height: 30, borderRadius: 6 }}>
-                          <Text style={{ fontSize: 14 }}>🗑️</Text>
-                        </Pressable>
-                      </View>
+                          <Pressable
+                            accessibilityRole="button"
+                            accessibilityLabel={t('dc_recordPurchaseTitle')}
+                            onPress={handleOpenSelectedPurchase}
+                            disabled={selectedPurchaseSaving}
+                            style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: colors.amberBorder, borderRadius: 6, backgroundColor: colors.amberBg, opacity: selectedPurchaseSaving ? 0.5 : 1 }}>
+                            <Text style={{ fontSize: 16, fontWeight: '800', color: colors.amber }}>+</Text>
+                          </Pressable>
+                        </>
+                      )}
                     </View>
                   </View>
-                );
-              })}
+                  {filteredInventory.map((item, index) => {
+                    const isLow = item.stockQty <= item.lowStockThreshold;
+                    const isSelected = selectedInventoryIds.includes(item.id);
+                    return (
+                      <View key={item.id} style={{ paddingHorizontal: 9, paddingVertical: 8, borderBottomWidth: index < inventory.length - 1 ? 1 : 0, borderBottomColor: colors.border, backgroundColor: isSelected ? colors.brandBg : '#FFFFFF' }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'flex-start' }}>
+                          <Pressable
+                            accessibilityRole="checkbox"
+                            accessibilityState={{ checked: isSelected }}
+                            accessibilityLabel={item.name}
+                            onPress={() => toggleInventoryCartItem(item)}
+                            disabled={item.stockQty <= 0}
+                            style={{ width: 30, height: 30, alignItems: 'flex-start', justifyContent: 'center', opacity: item.stockQty <= 0 ? 0.45 : 1 }}>
+                            <View style={{ width: 20, height: 20, alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1.5, borderColor: isSelected ? colors.brand : '#94A3B8', backgroundColor: isSelected ? colors.brand : '#FFFFFF' }}>
+                              {isSelected && <Text style={{ color: '#FFFFFF', fontSize: 14, lineHeight: 16, fontWeight: '800' }}>✓</Text>}
+                            </View>
+                          </Pressable>
+                          <View style={{ flex: 1, minWidth: 0 }}>
+                            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                              <View style={{ flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                                <Text style={{ flexShrink: 1, fontSize: 12, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{item.name}</Text>
+                                <Text style={{ flexShrink: 1, fontSize: 9, color: colors.muted }} numberOfLines={1}>{item.category || '—'}</Text>
+                              </View>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginLeft: 5 }}>
+                                {isLow && (
+                                  <Pressable
+                                    accessibilityLabel={`Restock ${item.name}`}
+                                    onPress={() => handleOpenEditStock(item)}
+                                    style={{ alignItems: 'center', justifyContent: 'center', backgroundColor: '#FFFBEB', borderColor: '#FDE68A', borderWidth: 1, width: 26, height: 26, borderRadius: 6 }}>
+                                    <Text style={{ fontSize: 12 }}>✏️</Text>
+                                  </Pressable>
+                                )}
+                                <Pressable
+                                  accessibilityLabel={`Price trend for ${item.name}`}
+                                  onPress={() => handleOpenPriceTrend(item)}
+                                  style={{ alignItems: 'center', justifyContent: 'center', backgroundColor: colors.brandBg, borderColor: '#C7D2FE', borderWidth: 1, width: 26, height: 26, borderRadius: 6 }}>
+                                  <Text style={{ fontSize: 12 }}>📈</Text>
+                                </Pressable>
+                              </View>
+                            </View>
+                            <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', columnGap: 8, marginTop: 3 }}>
+                              <Text style={{ fontSize: 10, fontWeight: '700', color: colors.navy }}>{item.stockQty} {item.unit}</Text>
+                              <Text style={{ fontSize: 9, fontWeight: '700', color: item.stockQty <= 0 ? colors.red : isLow ? colors.amber : colors.green }}>
+                                {item.stockQty <= 0 ? t('inv_outOfStock') : isLow ? t('inv_lowStock') : t('inv_inStock')}
+                              </Text>
+                              <Text style={{ fontSize: 10, fontWeight: '800', color: colors.navy }}>₹{item.sellingPrice}/{item.unit}</Text>
+                              <Text style={{ fontSize: 9, color: colors.muted }}>₹{item.costPrice} {t('inv_costPrice')}</Text>
+                            </View>
+                          </View>
+                        </View>
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+
+              <Modal visible={showInventoryCartModal} animationType="slide" transparent onRequestClose={() => setShowInventoryCartModal(false)}>
+                <View style={styles.modalOverlay}>
+                  <View style={styles.modalContent}>
+                    <View style={styles.modalHeaderRow}>
+                      <Text style={styles.modalHeading}>🛒 {t('inv_cartTitle')}</Text>
+                      <Pressable onPress={() => setShowInventoryCartModal(false)}>
+                        <Text style={styles.modalCloseText}>✕</Text>
+                      </Pressable>
+                    </View>
+                    {inventoryCartItems.length === 0 ? (
+                      <Text style={styles.emptyStateText}>{t('inv_cartEmpty')}</Text>
+                    ) : (
+                      <>
+                        <ScrollView style={{ maxHeight: 420 }}>
+                          {inventoryCartItems.map(item => {
+                            const quantity = Math.min(item.stockQty, Math.max(0, Number(cartQuantities[item.id]) || 0));
+                            const lineAmount = quantity * item.sellingPrice;
+                            return (
+                              <View key={item.id} style={{ paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10 }}>
+                                  <View style={{ flex: 1 }}>
+                                    <Text style={{ fontSize: 14, fontWeight: '700', color: colors.navy }}>{item.name}</Text>
+                                    <Text style={{ fontSize: 11, color: colors.muted, marginTop: 3 }}>₹{item.sellingPrice}/{item.unit}</Text>
+                                  </View>
+                                  <Text style={{ fontSize: 14, fontWeight: '800', color: colors.navy }}>₹{lineAmount.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Text>
+                                </View>
+                                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 10 }}>
+                                  <View>
+                                    <Text style={{ fontSize: 11, fontWeight: '700', color: colors.slate }}>{t('inv_cartQuantity')}</Text>
+                                    <Text style={{ fontSize: 10, color: colors.muted, marginTop: 2 }}>{t('inv_cartStockAvailable', { qty: item.stockQty, unit: item.unit })}</Text>
+                                  </View>
+                                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                                    <Pressable
+                                      accessibilityRole="button"
+                                      accessibilityLabel={t('inv_cartDecreaseQuantity')}
+                                      onPress={() => adjustInventoryCartQuantity(item, -1)}
+                                      style={{ width: 34, height: 34, alignItems: 'center', justifyContent: 'center', borderRadius: 8, borderWidth: 1, borderColor: colors.border }}>
+                                      <Text style={{ fontSize: 18, fontWeight: '700', color: colors.navy }}>−</Text>
+                                    </Pressable>
+                                    <TextInput
+                                      keyboardType="decimal-pad"
+                                      value={cartQuantities[item.id] ?? ''}
+                                      onChangeText={value => updateInventoryCartQuantity(item, value)}
+                                      onEndEditing={() => {
+                                        const entered = Number(cartQuantities[item.id]);
+                                        const valid = Number.isFinite(entered) && entered > 0 ? entered : Math.min(1, item.stockQty);
+                                        setCartQuantities(previous => ({ ...previous, [item.id]: String(Math.min(item.stockQty, valid)) }));
+                                      }}
+                                      style={{ width: 58, height: 36, paddingHorizontal: 6, borderWidth: 1, borderColor: colors.border, borderRadius: 8, textAlign: 'center', color: colors.navy }} />
+                                    <Pressable
+                                      accessibilityRole="button"
+                                      accessibilityLabel={t('inv_cartIncreaseQuantity')}
+                                      onPress={() => adjustInventoryCartQuantity(item, 1)}
+                                      style={{ width: 34, height: 34, alignItems: 'center', justifyContent: 'center', borderRadius: 8, borderWidth: 1, borderColor: colors.border }}>
+                                      <Text style={{ fontSize: 18, fontWeight: '700', color: colors.navy }}>+</Text>
+                                    </Pressable>
+                                  </View>
+                                </View>
+                              </View>
+                            );
+                          })}
+                        </ScrollView>
+                        <View style={{ borderTopWidth: 1, borderTopColor: colors.border, marginTop: 12, paddingTop: 12 }}>
+                          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                            <Text style={{ fontSize: 12, fontWeight: '700', color: colors.slate }}>{t('inv_cartPaymentMethod')}</Text>
+                            <View style={{ flexDirection: 'row', gap: 6 }}>
+                              {(['CASH', 'UPI', 'CREDIT'] as const).map(method => (
+                                <Pressable
+                                  key={method}
+                                  accessibilityRole="button"
+                                  accessibilityState={{ selected: cartPaymentMethod === method }}
+                                  onPress={() => {
+                                    setCartPaymentMethod(method);
+                                    if (method === 'CREDIT' && customers.length === 0) loadCustomers();
+                                  }}
+                                  style={{ paddingVertical: 6, paddingHorizontal: 9, borderRadius: 7, borderWidth: 1, borderColor: cartPaymentMethod === method ? colors.brand : colors.border, backgroundColor: cartPaymentMethod === method ? colors.brandBg : '#FFFFFF' }}>
+                                  <Text style={{ fontSize: 10, fontWeight: '700', color: cartPaymentMethod === method ? colors.brand : colors.slate }}>
+                                    {method === 'CASH' ? t('common_cash') : method === 'UPI' ? t('common_upi') : t('common_credit')}
+                                  </Text>
+                                </Pressable>
+                              ))}
+                            </View>
+                          </View>
+                          {cartPaymentMethod === 'CREDIT' && (
+                            <View style={{ marginBottom: 10 }}>
+                              <Text style={{ fontSize: 11, fontWeight: '700', color: colors.slate, marginBottom: 5 }}>{t('dc_customerNameLabel')}</Text>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingHorizontal: 10, backgroundColor: '#FFFFFF' }}>
+                                <TextInput
+                                  accessibilityLabel={t('dc_customerNameLabel')}
+                                  value={cartCreditCustomerName}
+                                  onChangeText={value => { setCartCreditCustomerName(value); setShowCartCustomerPicker(true); }}
+                                  onFocus={() => setShowCartCustomerPicker(true)}
+                                  placeholder={t('dc_customerNamePlaceholder')}
+                                  placeholderTextColor={colors.muted}
+                                  style={{ flex: 1, minHeight: 42, paddingVertical: 0, fontSize: 12, color: colors.navy }}
+                                />
+                                <Pressable
+                                  accessibilityRole="button"
+                                  accessibilityLabel={t('dc_customerNameLabel')}
+                                  onPress={() => setShowCartCustomerPicker(previous => !previous)}
+                                  style={{ paddingHorizontal: 4, paddingVertical: 8 }}>
+                                  <Text style={{ color: colors.brand }}>▼</Text>
+                                </Pressable>
+                              </View>
+                              {showCartCustomerPicker && (() => {
+                                const query = cartCreditCustomerName.trim().toLocaleLowerCase();
+                                const matches = customers.filter((customer: any) => !query || customer.customerName.toLocaleLowerCase().includes(query));
+                                if (matches.length === 0) return null;
+                                return (
+                                  <View style={{ maxHeight: 120, borderWidth: 1, borderColor: colors.border, borderRadius: 8, marginTop: 5, overflow: 'hidden' }}>
+                                    <ScrollView keyboardShouldPersistTaps="handled">
+                                      {matches.map((customer: any) => (
+                                        <Pressable
+                                          key={customer.customerName}
+                                          onPress={() => { setCartCreditCustomerName(customer.customerName); setShowCartCustomerPicker(false); }}
+                                          style={{ paddingVertical: 8, paddingHorizontal: 10, backgroundColor: customer.customerName === cartCreditCustomerName ? colors.brandBg : '#FFFFFF' }}>
+                                          <Text style={{ fontSize: 11, color: colors.navy }}>🧑 {customer.customerName}</Text>
+                                        </Pressable>
+                                      ))}
+                                    </ScrollView>
+                                  </View>
+                                );
+                              })()}
+                            </View>
+                          )}
+                          <Pressable
+                            accessibilityRole="button"
+                            accessibilityLabel={`${t(cartPaymentMethod === 'CREDIT' ? 'dc_recordSaleTitle' : 'inv_cartRecordPayment')} ₹${inventoryCartTotal}`}
+                            onPress={handleSaveInventoryCart}
+                            disabled={cartCheckoutLoading || inventoryCartItems.length === 0}
+                            style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', borderRadius: 10, backgroundColor: colors.brand, paddingHorizontal: 14, paddingVertical: 12, opacity: cartCheckoutLoading || inventoryCartItems.length === 0 ? 0.6 : 1 }}>
+                            <View>
+                              <Text style={{ fontSize: 11, fontWeight: '700', color: '#E0E7FF' }}>{t('inv_cartTotal')}</Text>
+                              <Text style={{ fontSize: 12, fontWeight: '700', color: '#FFFFFF', marginTop: 2 }}>{cartCheckoutLoading ? t('common_saving') : t(cartPaymentMethod === 'CREDIT' ? 'dc_recordSaleTitle' : 'inv_cartRecordPayment')}</Text>
+                            </View>
+                            <Text style={{ fontSize: 18, fontWeight: '800', color: '#FFFFFF' }}>₹{inventoryCartTotal.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Text>
+                          </Pressable>
+                        </View>
+                      </>
+                    )}
+                  </View>
+                </View>
+              </Modal>
+
+              <Modal visible={showSelectedPurchaseModal} animationType="slide" transparent onRequestClose={() => setShowSelectedPurchaseModal(false)}>
+                <View style={styles.modalOverlay}>
+                  <View style={[styles.modalContent, { paddingHorizontal: 10 }]}>
+                    <View style={styles.modalHeaderRow}>
+                      <Text style={styles.modalHeading}>📥 {t('dc_recordPurchaseTitle')}</Text>
+                      <Pressable onPress={() => setShowSelectedPurchaseModal(false)}>
+                        <Text style={styles.modalCloseText}>✕</Text>
+                      </Pressable>
+                    </View>
+                    <ScrollView style={{ maxHeight: 420 }} keyboardShouldPersistTaps="handled">
+                      <View style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, overflow: 'hidden' }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 7, paddingVertical: 8, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                          <Text style={{ flex: 1, fontSize: 9, fontWeight: '800', color: colors.muted }}>{t('inv_product')}</Text>
+                          <Text style={{ width: 42, fontSize: 8, fontWeight: '800', color: colors.muted, textAlign: 'center' }}>{t('dc_qty')}</Text>
+                          <Text style={{ width: 54, fontSize: 7, fontWeight: '800', color: colors.muted, textAlign: 'center' }}>{t('dc_totalCost')}</Text>
+                          <Text style={{ width: 82, fontSize: 8, fontWeight: '800', color: colors.muted, textAlign: 'center' }}>{t('dc_vendor')}</Text>
+                          <Text style={{ width: 32, fontSize: 7, fontWeight: '800', color: colors.muted, textAlign: 'center' }}>{t('dc_paymentShort')}</Text>
+                        </View>
+                        {inventory.filter(item => selectedInventoryIds.includes(item.id)).map((item, index, selectedProducts) => {
+                          const isVendorPickerOpen = selectedPurchaseVendorPickerId === item.id;
+                          const vendorSearch = (selectedPurchaseVendorSearches[item.id] || '').trim().toLocaleLowerCase();
+                          const matchingVendors = vendors.filter((vendor: any) => vendor.vendorName.toLocaleLowerCase().includes(vendorSearch));
+                          return (
+                            <View key={item.id} style={{ borderBottomWidth: index < selectedProducts.length - 1 ? 1 : 0, borderBottomColor: colors.border }}>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 7, paddingVertical: 8, gap: 4 }}>
+                                <View style={{ flex: 1, minWidth: 0 }}>
+                                  <Text style={{ fontSize: 10, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{item.name}</Text>
+                                  <Text style={{ fontSize: 8, color: colors.muted }}>{item.unit}</Text>
+                                </View>
+                                <TextInput
+                                  accessibilityLabel={`${t('dc_quantityPurchased')} ${item.name}`}
+                                  keyboardType="decimal-pad"
+                                  placeholder="0"
+                                  placeholderTextColor={colors.muted}
+                                  style={{ width: 42, height: 38, paddingHorizontal: 2, borderWidth: 1, borderColor: colors.border, borderRadius: 7, textAlign: 'center', color: colors.navy, fontSize: 10 }}
+                                  value={selectedPurchaseQuantities[item.id] || ''}
+                                  onChangeText={value => setSelectedPurchaseQuantities(previous => ({ ...previous, [item.id]: value }))}
+                                />
+                                <TextInput
+                                  accessibilityLabel={`${t('dc_totalCost')} ${item.name}`}
+                                  keyboardType="decimal-pad"
+                                  placeholder="0"
+                                  placeholderTextColor={colors.muted}
+                                  style={{ width: 54, height: 38, paddingHorizontal: 2, borderWidth: 1, borderColor: colors.border, borderRadius: 7, textAlign: 'center', color: colors.navy, fontSize: 10 }}
+                                  value={selectedPurchaseAmounts[item.id] || ''}
+                                  onChangeText={value => setSelectedPurchaseAmounts(previous => ({ ...previous, [item.id]: value }))}
+                                />
+                                <Pressable
+                                  accessibilityRole="button"
+                                  accessibilityLabel={`${t('dc_vendorNameLabel')} ${item.name}`}
+                                  onPress={() => {
+                                    setSelectedPurchaseVendorPickerId(isVendorPickerOpen ? null : item.id);
+                                    if (!isVendorPickerOpen) setSelectedPurchaseVendorSearches(previous => ({ ...previous, [item.id]: '' }));
+                                  }}
+                                  style={{ width: 82, height: 38, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 4, borderWidth: 1, borderColor: colors.border, borderRadius: 7, backgroundColor: '#FFFFFF' }}>
+                                  <Text style={{ flex: 1, fontSize: 8, color: selectedPurchaseVendors[item.id] ? colors.navy : colors.muted }} numberOfLines={1}>
+                                    {selectedPurchaseVendors[item.id] || t('dc_vendorNamePlaceholder')}
+                                  </Text>
+                                  <Text style={{ fontSize: 10, color: colors.brand }}>{isVendorPickerOpen ? '▲' : '▼'}</Text>
+                                </Pressable>
+                                <View style={{ width: 32, alignItems: 'center' }}>
+                                  <Pressable
+                                    accessibilityRole="checkbox"
+                                    accessibilityState={{ checked: !!selectedPurchasePaid[item.id] }}
+                                    accessibilityLabel={`${t('dc_paymentShort')} ${item.name}`}
+                                    onPress={() => setSelectedPurchasePaid(previous => ({ ...previous, [item.id]: !previous[item.id] }))}
+                                    style={{ width: 24, height: 28, alignItems: 'center', justifyContent: 'center' }}>
+                                    <View style={{ width: 18, height: 18, alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1.5, borderColor: selectedPurchasePaid[item.id] ? colors.brand : '#94A3B8', backgroundColor: selectedPurchasePaid[item.id] ? colors.brand : '#FFFFFF' }}>
+                                      {selectedPurchasePaid[item.id] && <Text style={{ color: '#FFFFFF', fontSize: 12, lineHeight: 14, fontWeight: '800' }}>✓</Text>}
+                                    </View>
+                                  </Pressable>
+                                </View>
+                              </View>
+                              {isVendorPickerOpen && (
+                                <View style={{ marginHorizontal: 7, marginBottom: 8, borderWidth: 1, borderColor: colors.border, borderRadius: 7, overflow: 'hidden' }}>
+                                  <TextInput
+                                    accessibilityLabel={t('dc_searchVendor')}
+                                    placeholder={t('dc_searchVendor')}
+                                    placeholderTextColor={colors.muted}
+                                    value={selectedPurchaseVendorSearches[item.id] || ''}
+                                    onChangeText={value => setSelectedPurchaseVendorSearches(previous => ({ ...previous, [item.id]: value }))}
+                                    style={{ minHeight: 38, paddingHorizontal: 10, fontSize: 11, color: colors.navy, borderBottomWidth: 1, borderBottomColor: colors.border }}
+                                  />
+                                  {vendorsLoading ? (
+                                    <ActivityIndicator color={colors.brand} style={{ padding: 10 }} />
+                                  ) : matchingVendors.length > 0 ? matchingVendors.map((vendor: any) => (
+                                    <Pressable
+                                      key={vendor.vendorName}
+                                      onPress={() => {
+                                        setSelectedPurchaseVendors(previous => ({ ...previous, [item.id]: vendor.vendorName }));
+                                        setSelectedPurchaseVendorPickerId(null);
+                                      }}
+                                      style={{ paddingVertical: 8, paddingHorizontal: 10, backgroundColor: vendor.vendorName === selectedPurchaseVendors[item.id] ? colors.brandBg : '#FFFFFF' }}>
+                                      <Text style={{ fontSize: 11, color: colors.navy }}>🏪 {vendor.vendorName}</Text>
+                                    </Pressable>
+                                  )) : (
+                                    <Text style={{ padding: 10, fontSize: 10, color: colors.muted }}>{t('dc_noVendorMatches')}</Text>
+                                  )}
+                                </View>
+                              )}
+                            </View>
+                          );
+                        })}
+                      </View>
+                    </ScrollView>
+                    <Pressable
+                      onPress={handleSaveSelectedPurchase}
+                      disabled={selectedPurchaseSaving}
+                      style={[styles.modalSubmitBtn, { marginTop: 12 }, selectedPurchaseSaving && { opacity: 0.6 }]}>
+                      <Text style={styles.modalSubmitBtnText}>{selectedPurchaseSaving ? t('common_saving') : 'Save Transactions'}</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              </Modal>
 
               {restockSuggestions.length > 0 && (
                 <View style={styles.chartCard}>
@@ -8292,9 +10641,6 @@ function CustomerAppContent() {
               </Text>
 
               <View style={{ flexDirection: 'row', gap: 8, marginBottom: 14 }}>
-                <Pressable onPress={() => handleOpenRecordSale(undefined, 'SALE')} style={[styles.primaryPillBtn, { flex: 1, alignItems: 'center' }]}>
-                  <Text style={styles.primaryPillBtnText}>🧾 {t('dc_sale')}</Text>
-                </Pressable>
                 <Pressable onPress={() => handleOpenRecordSale(undefined, 'PURCHASE')} style={[styles.primaryPillBtn, { flex: 1, alignItems: 'center', backgroundColor: '#D97706' }]}>
                   <Text style={styles.primaryPillBtnText}>📥 {t('dc_purchase')}</Text>
                 </Pressable>
@@ -8321,21 +10667,49 @@ function CustomerAppContent() {
                   <Text style={[styles.kpiValue, styles.textNegative]}>₹{(inventorySummary?.wastageValue || 0).toLocaleString()}</Text>
                   <Text style={styles.kpiSub}>{t('dc_unitsLost', { qty: inventorySummary?.wastageQuantity || 0 })}</Text>
                 </View>
-                <View style={styles.kpiCard}>
-                  <Text style={styles.kpiLabel}>{t('dc_transactions')}</Text>
-                  <Text style={[styles.kpiValue, { color: colors.brand }]}>{inventorySummary?.totalCount || 0}</Text>
-                  <Text style={styles.kpiSub}>{t('dc_recorded')}</Text>
-                </View>
+                <Pressable style={styles.kpiCard} onPress={handleOpenAddExpense}>
+                  <Text style={styles.kpiLabel}>{t('dc_expenses')}</Text>
+                  <Text style={[styles.kpiValue, { color: '#D97706' }]}>₹{(inventorySummary?.expenseValue || 0).toLocaleString()}</Text>
+                  <Text style={styles.kpiSub}>{t('dc_tapToAdd')}</Text>
+                </Pressable>
               </View>
               <View style={styles.kpiRow}>
-                <View style={[styles.kpiCard, { flex: 1 }]}>
+                <View style={styles.kpiCard}>
+                  <Text style={styles.kpiLabel}>{t('dc_transactions')}</Text>
+                  <Text style={[styles.kpiValue, { color: colors.brand }]}>{groupedDailyTransactions.length}</Text>
+                  <Text style={styles.kpiSub}>{t('dc_recorded')}</Text>
+                </View>
+                <View style={styles.kpiCard}>
                   <Text style={styles.kpiLabel}>{t('dc_netProfit')}</Text>
                   <Text style={[styles.kpiValue, (inventorySummary?.netProfit || 0) >= 0 ? styles.textPositive : styles.textNegative]}>
                     ₹{(inventorySummary?.netProfit || 0).toLocaleString()}
                   </Text>
-                  <Text style={styles.kpiSub}>{t('dc_netProfitHint')}</Text>
+                  <Text style={styles.kpiSub}>{t('dc_netProfitHintWithExpenses')}</Text>
                 </View>
               </View>
+
+              {expenses.length > 0 && (
+                <View style={[styles.chartCard, { marginBottom: 14 }]}>
+                  <View style={styles.chartCardHeaderRow}>
+                    <Text style={styles.chartCardTitle}>🧾 {t('dc_expensesTitle')}</Text>
+                    <Pressable onPress={handleOpenAddExpense}>
+                      <Text style={{ fontSize: 12, color: colors.brand, fontWeight: '700' }}>{t('dc_addExpense')}</Text>
+                    </Pressable>
+                  </View>
+                  {expenses.map((e: any) => (
+                    <View key={e.id} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }}>{e.category}</Text>
+                        {!!e.note && <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }}>{e.note}</Text>}
+                      </View>
+                      <Text style={{ fontSize: 14, fontWeight: '800', color: '#D97706', marginRight: 10 }}>₹{e.amount.toLocaleString()}</Text>
+                      <Pressable onPress={() => handleDeleteExpense(e.id)} hitSlop={8}>
+                        <Text style={{ fontSize: 13 }}>🗑️</Text>
+                      </Pressable>
+                    </View>
+                  ))}
+                </View>
+              )}
 
               {inventoryTransactions.length === 0 && !inventoryLoading && (
                 <Text style={styles.emptyStateText}>{t('dc_emptyState')}</Text>
@@ -8350,108 +10724,376 @@ function CustomerAppContent() {
                     <Text style={[styles.txTableHeaderText, { flex: 1, textAlign: 'right' }]}>{t('dc_amount')}</Text>
                     <View style={{ width: 30 }} />
                   </View>
-                  {inventoryTransactions.map(tx => {
+                  {groupedDailyTransactions.map(group => {
+                    const tx = group.transactions[0];
+                    const isCartGroup = !!group.cartId;
+                    const isExpanded = isCartGroup && expandedInventoryCartId === group.cartId;
                     const isWastage = tx.type === 'WASTAGE';
                     const isPurchase = tx.type === 'PURCHASE';
+                    const groupAmount = group.transactions.reduce((sum: number, item: any) => sum + item.amount, 0);
                     return (
-                      <View key={tx.id} style={styles.txTableRow}>
-                        <View style={{ flex: 1.3 }}>
-                          <Text style={styles.txTableCellName} numberOfLines={1}>{tx.productName}</Text>
-                          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4, marginTop: 2 }}>
-                            {isWastage && (
-                              <View style={styles.wastageTag}>
-                                <Text style={styles.wastageTagText}>{t('dc_wastageLabel')}</Text>
-                              </View>
+                      <React.Fragment key={group.key}>
+                        <View style={[styles.txTableRow, isCartGroup && { backgroundColor: '#F8FAFC' }]}>
+                          <Pressable
+                            disabled={!isCartGroup}
+                            onPress={() => setExpandedInventoryCartId(isExpanded ? null : group.cartId)}
+                            style={{ flex: 1.3 }}>
+                            {isCartGroup ? (
+                              <Text style={styles.txTableCellName}>
+                                {t(tx.type === 'PURCHASE' ? 'dc_cartPurchaseGroupTitle' : 'dc_cartGroupTitle', { count: group.transactions.length })}
+                              </Text>
+                            ) : (
+                              <>
+                                <Text style={styles.txTableCellName} numberOfLines={1}>{tx.productName}</Text>
+                                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4, marginTop: 2 }}>
+                                  {isWastage && (
+                                    <View style={styles.wastageTag}>
+                                      <Text style={styles.wastageTagText}>{t('dc_wastageLabel')}</Text>
+                                    </View>
+                                  )}
+                                  {isPurchase && (
+                                    <View style={[styles.wastageTag, { backgroundColor: '#FFFBEB', borderColor: '#FDE68A' }]}>
+                                      <Text style={[styles.wastageTagText, { color: '#B45309' }]}>{t('dc_purchases')}</Text>
+                                    </View>
+                                  )}
+                                  {isPurchase && tx.amountDue > 0 && (
+                                    <View style={[styles.wastageTag, { backgroundColor: colors.redBg, borderColor: colors.redBorder }]}>
+                                      <Text style={[styles.wastageTagText, { color: colors.red }]}>{t('dc_vendorDueShort')} ₹{tx.amountDue}</Text>
+                                    </View>
+                                  )}
+                                </View>
+                                {isPurchase && !!tx.note && (
+                                  <Pressable onPress={() => handleOpenVendorLedger(tx.note)} hitSlop={4}>
+                                    <Text style={{ fontSize: 11, color: colors.brand, fontWeight: '700', marginTop: 3, textDecorationLine: 'underline' }} numberOfLines={1}>
+                                      🏪 {tx.note}
+                                    </Text>
+                                  </Pressable>
+                                )}
+                              </>
                             )}
-                            {isPurchase && (
-                              <View style={[styles.wastageTag, { backgroundColor: '#FFFBEB', borderColor: '#FDE68A' }]}>
-                                <Text style={[styles.wastageTagText, { color: '#B45309' }]}>{t('dc_purchases')}</Text>
-                              </View>
-                            )}
-                            {isPurchase && tx.amountDue > 0 && (
-                              <View style={[styles.wastageTag, { backgroundColor: colors.redBg, borderColor: colors.redBorder }]}>
-                                <Text style={[styles.wastageTagText, { color: colors.red }]}>{t('dc_vendorDueShort')} ₹{tx.amountDue}</Text>
-                              </View>
+                          </Pressable>
+                          <Text style={[styles.txTableCell, { flex: 0.8, textAlign: 'center' }]}>
+                            {isCartGroup ? t('dc_cartItemsCount', { count: group.transactions.length }) : tx.quantity > 0 ? `${tx.quantity} ${tx.unit}` : '—'}
+                          </Text>
+                          <View style={{ flex: 1, alignItems: 'center' }}>
+                            <Text style={[styles.txTableCell, { textAlign: 'center' }]}>{tx.date}</Text>
+                            {!!tx.createdAt && (
+                              <Text style={{ fontSize: 9, color: colors.muted, marginTop: 2 }}>
+                                {new Date(tx.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              </Text>
                             )}
                           </View>
-                          {isPurchase && !!tx.note && (
-                            <Pressable onPress={() => handleOpenVendorLedger(tx.note)} hitSlop={4}>
-                              <Text style={{ fontSize: 11, color: colors.brand, fontWeight: '700', marginTop: 3, textDecorationLine: 'underline' }} numberOfLines={1}>
-                                🏪 {tx.note}
-                              </Text>
+                          <Text
+                            style={[
+                              styles.txTableCellAmount,
+                              { flex: 1, textAlign: 'right' },
+                              isWastage && { color: colors.red },
+                              isPurchase && { color: '#B45309' },
+                            ]}>
+                            {isWastage || isPurchase ? '−' : '+'}₹{(isCartGroup ? groupAmount : tx.amount).toLocaleString()}
+                          </Text>
+                          {isCartGroup ? (
+                            <Pressable
+                              accessibilityRole="button"
+                              accessibilityLabel={t(isExpanded ? 'dc_collapseCart' : 'dc_expandCart')}
+                              onPress={() => setExpandedInventoryCartId(isExpanded ? null : group.cartId)}
+                              style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', marginLeft: 4 }}>
+                              <Text style={{ fontSize: 16, color: colors.brand }}>{isExpanded ? '⌃' : '⌄'}</Text>
                             </Pressable>
+                          ) : (
+                            <>
+                              <Pressable
+                                onPress={() => handleOpenEditTransaction(tx)}
+                                style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', marginLeft: 4 }}>
+                                <Text style={{ fontSize: 13 }}>✏️</Text>
+                              </Pressable>
+                              <Pressable
+                                onPress={() => handleDeleteTransaction(tx)}
+                                style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center' }}>
+                                <Text style={{ fontSize: 13 }}>🗑️</Text>
+                              </Pressable>
+                            </>
                           )}
                         </View>
-                        <Text style={[styles.txTableCell, { flex: 0.8, textAlign: 'center' }]}>
-                          {tx.quantity > 0 ? `${tx.quantity} ${tx.unit}` : '—'}
-                        </Text>
-                        <Text style={[styles.txTableCell, { flex: 1, textAlign: 'center' }]}>{tx.date}</Text>
-                        <Text
-                          style={[
-                            styles.txTableCellAmount,
-                            { flex: 1, textAlign: 'right' },
-                            isWastage && { color: colors.red },
-                            isPurchase && { color: '#B45309' },
-                          ]}>
-                          {isWastage || isPurchase ? '−' : '+'}₹{tx.amount.toLocaleString()}
-                        </Text>
-                        <Pressable
-                          onPress={() => handleDeleteTransaction(tx)}
-                          style={{ width: 30, height: 26, alignItems: 'center', justifyContent: 'center', marginLeft: 4 }}>
-                          <Text style={{ fontSize: 13 }}>🗑️</Text>
-                        </Pressable>
-                      </View>
+                        {isExpanded && group.transactions.map((cartTx: any) => (
+                          <View key={cartTx.id} style={[styles.txTableRow, { paddingLeft: 18, paddingVertical: 6, backgroundColor: '#FCFDFE' }]}>
+                            <Text style={[styles.txTableCellName, { flex: 1.3, fontSize: 11 }]} numberOfLines={1}>{cartTx.productName}</Text>
+                            <Text style={[styles.txTableCell, { flex: 0.8, fontSize: 10, textAlign: 'center' }]}>{cartTx.quantity} {cartTx.unit}</Text>
+                            <View style={{ flex: 1, alignItems: 'center' }}>
+                              <Text style={[styles.txTableCell, { fontSize: 10, textAlign: 'center' }]}>{cartTx.date}</Text>
+                              {!!cartTx.createdAt && (
+                                <Text style={{ fontSize: 8, color: colors.muted, marginTop: 1 }}>
+                                  {new Date(cartTx.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </Text>
+                              )}
+                            </View>
+                            <Text style={[styles.txTableCellAmount, { flex: 1, fontSize: 11, textAlign: 'right' }, cartTx.type === 'PURCHASE' && { color: '#B45309' }]}>
+                              {cartTx.type === 'PURCHASE' ? '−' : '+'}₹{cartTx.amount.toLocaleString()}
+                            </Text>
+                            <Pressable
+                              onPress={() => handleOpenEditTransaction(cartTx)}
+                              style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', marginLeft: 4 }}>
+                              <Text style={{ fontSize: 11 }}>✏️</Text>
+                            </Pressable>
+                            <Pressable
+                              onPress={() => handleDeleteTransaction(cartTx)}
+                              style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center' }}>
+                              <Text style={{ fontSize: 11 }}>🗑️</Text>
+                            </Pressable>
+                          </View>
+                        ))}
+                      </React.Fragment>
                     );
                   })}
                 </View>
               )}
 
-              {(inventorySummary?.byProduct || []).length > 0 && (
-                <View style={styles.chartCard}>
-                  <View style={styles.chartCardHeaderRow}>
-                    <Text style={styles.chartCardTitle}>🍊 {t('dc_fruitwiseSales')}</Text>
-                    <Text style={styles.chartCardBadge}>
-                      {dcSelectedDate === formatDateISO(new Date()) ? t('common_today') : formatDisplayDate(dcSelectedDate)}
-                    </Text>
-                  </View>
-                  {(() => {
-                    const rows = (inventorySummary?.byProduct || []) as any[];
-                    const max = Math.max(...rows.map(r => r.amount), 1);
-                    return (
-                      <View>
-                        {rows.map((row, idx) => (
-                          <View key={row.productName} style={styles.rankRow}>
-                            <View style={[styles.rankBadge, { backgroundColor: PIE_CHART_PALETTE[idx % PIE_CHART_PALETTE.length] }]}>
-                              <Text style={styles.rankBadgeText}>{idx + 1}</Text>
-                            </View>
-                            <View style={{ flex: 1 }}>
-                              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
-                                <Text style={styles.rankProductName}>{row.productName}</Text>
-                                <Text style={styles.rankAmount}>₹{row.amount.toLocaleString()}</Text>
-                              </View>
-                              <View style={styles.rankTrack}>
-                                <View
-                                  style={[
-                                    styles.rankFill,
-                                    { width: `${Math.max((row.amount / max) * 100, 4)}%`, backgroundColor: PIE_CHART_PALETTE[idx % PIE_CHART_PALETTE.length] },
-                                  ]}>
-                                  <View style={styles.rankFillSheen} />
-                                </View>
-                              </View>
-                            </View>
-                          </View>
-                        ))}
-                      </View>
-                    );
-                  })()}
-                </View>
-              )}
             </View>
           )}
 
           {/* Business Feature Tab: Insights / Charts (Fruit/Vegetable & Retailer) */}
           {activeTab === 'inventory_insights' && (hasFeature('inventory') || hasFeature('products')) && (
             <View>
+              <View style={styles.chartCard}>
+                <View style={styles.chartCardHeaderRow}>
+                  <Text style={styles.chartCardTitle}>📑 {t('ins_reportTitle')}</Text>
+                  {!!periodReport && periodReport.period === profitPeriod && (
+                    <Text style={styles.chartCardBadge}>{formatDisplayDate(periodReport.startDate)} – {formatDisplayDate(periodReport.endDate)}</Text>
+                  )}
+                </View>
+                <View style={styles.modePillRow}>
+                  {([
+                    { key: 'weekly' as const, label: t('ins_thisWeek') },
+                    { key: 'monthly' as const, label: t('ins_thisMonth') },
+                  ]).map(opt => (
+                    <Pressable
+                      key={opt.key}
+                      onPress={() => setProfitPeriod(opt.key)}
+                      style={[styles.modePill, profitPeriod === opt.key && styles.modePillActive]}>
+                      <Text style={[styles.modePillText, profitPeriod === opt.key && styles.modePillTextActive]}>{opt.label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                {(() => {
+                  const sm = periodReport?.period === profitPeriod ? periodReport.summary : null;
+                  const profit = sm?.netProfit || 0;
+                  const line = (label: string, value: number, sign: string, color: string) => (
+                    <View key={label} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 7, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                      <Text style={{ fontSize: 13, color: colors.navy }}>{label}</Text>
+                      <Text style={{ fontSize: 13, fontWeight: '700', color }}>{sign}₹{(value || 0).toLocaleString()}</Text>
+                    </View>
+                  );
+                  return (
+                    <View style={{ marginTop: 6 }}>
+                      {line(t('ins_reportSales'), sm?.totalAmount, '+', colors.greenDark)}
+                      {line(t('ins_costOfGoods'), sm?.costOfGoodsSold, '−', '#B45309')}
+                      {line(t('dc_wastageLabel'), sm?.wastageValue, '−', colors.red)}
+                      {line(t('dc_expenses'), sm?.expenseValue, '−', '#B45309')}
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 10 }}>
+                        <Text style={{ fontSize: 15, fontWeight: '800', color: colors.navy }}>{t('dc_netProfit')}</Text>
+                        <Text style={{ fontSize: 16, fontWeight: '800', color: profit >= 0 ? colors.greenDark : colors.red }}>₹{profit.toLocaleString()}</Text>
+                      </View>
+                      <Text style={{ fontSize: 11, color: colors.muted, marginBottom: 10 }}>
+                        {t('dc_purchases')}: ₹{(sm?.purchaseValue || 0).toLocaleString()}
+                      </Text>
+                      <Pressable onPress={handleSharePeriodReport} style={[styles.primaryPillBtn, { alignItems: 'center' }]}>
+                        <Text style={styles.primaryPillBtnText}>📤 {t('ins_shareReport')}</Text>
+                      </Pressable>
+                    </View>
+                  );
+                })()}
+              </View>
+
+              <View style={styles.chartCard}>
+                <View style={styles.chartCardHeaderRow}>
+                  <Text style={styles.chartCardTitle}>💡 {t('price_heading')}</Text>
+                  <Text style={styles.chartCardBadge}>{t('ins_last30Days')}</Text>
+                </View>
+                {(() => {
+                  if (!pricingAdvisor) return <Text style={styles.emptyStateText}>{t('common_loading')}</Text>;
+                  const minPct = Math.max(0, Number(pricingMinMargin) || 0);
+                  const targetPct = Math.max(minPct, Number(pricingTargetMargin) || 0);
+                  const expenseShare = pricingAdvisor.expenseShare || 0;
+                  const money = (n: number) => Number(n.toFixed(2)).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+                  const signed = (n: number) => `${n < 0 ? '−' : ''}₹${money(Math.abs(n))}`;
+                  // Whole rupees, or 50 paise steps for cheap per-piece items.
+                  const roundUpPrice = (n: number) => {
+                    const v = Number(n.toFixed(2));
+                    return v >= 20 ? Math.ceil(v) : Math.ceil(v * 2) / 2;
+                  };
+                  const statusOrder = { loss: 0, low: 1, nocost: 2, ok: 3 };
+                  const rows = ((pricingAdvisor.products || []) as any[]).map(p => {
+                    const hasCost = p.costPrice > 0;
+                    // "Real" margin: against what a sellable unit cost once spoilage is counted.
+                    const afterWastage = p.sellingPrice - p.effectiveCost;
+                    const marginPct = hasCost ? (afterWastage / p.effectiveCost) * 100 : 0;
+                    const status: keyof typeof statusOrder = !hasCost ? 'nocost' : afterWastage < 0 ? 'loss' : marginPct < minPct ? 'low' : 'ok';
+                    return {
+                      p, hasCost, afterWastage, marginPct, status,
+                      gross: p.sellingPrice - p.costPrice,
+                      afterExpenses: p.sellingPrice * (1 - expenseShare) - p.effectiveCost,
+                      rangeLow: roundUpPrice(p.effectiveCost * (1 + minPct / 100)),
+                      rangeHigh: roundUpPrice(p.effectiveCost * (1 + targetPct / 100)),
+                    };
+                  }).sort((a, b) => statusOrder[a.status] - statusOrder[b.status] || a.marginPct - b.marginPct);
+                  const lossCount = rows.filter(r => r.status === 'loss').length;
+                  const lowCount = rows.filter(r => r.status === 'low').length;
+                  const statusStyle = {
+                    loss: { label: t('price_statusLoss'), color: colors.red, bg: colors.redBg },
+                    low: { label: t('price_statusLow'), color: colors.amber, bg: colors.amberBg },
+                    ok: { label: t('price_statusOk'), color: colors.greenDark, bg: colors.greenBg },
+                    nocost: { label: t('price_statusNoCost'), color: colors.muted, bg: colors.page },
+                  };
+                  const detailLine = (label: string, value: string, color: string = colors.navy) => (
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', gap: 10, paddingVertical: 4 }}>
+                      <Text style={{ flex: 1, fontSize: 11, color: colors.slate }}>{label}</Text>
+                      <Text style={{ fontSize: 11, fontWeight: '700', color }}>{value}</Text>
+                    </View>
+                  );
+                  return (
+                    <View>
+                      <View style={{ flexDirection: 'row', gap: 10 }}>
+                        {([
+                          { kind: 'min' as const, label: t('price_minMargin'), value: pricingMinMargin },
+                          { kind: 'target' as const, label: t('price_targetMargin'), value: pricingTargetMargin },
+                        ]).map(field => (
+                          <View key={field.kind} style={{ flex: 1 }}>
+                            <Text style={{ fontSize: 10, fontWeight: '700', color: colors.slate, marginBottom: 4 }}>{field.label}</Text>
+                            <TextInput
+                              accessibilityLabel={field.label}
+                              keyboardType="decimal-pad"
+                              value={field.value}
+                              onChangeText={value => updatePricingMargin(field.kind, value)}
+                              maxLength={5}
+                              style={{ height: 38, paddingHorizontal: 10, paddingVertical: 0, borderWidth: 1, borderColor: colors.border, borderRadius: 8, color: colors.navy, fontSize: 13, fontWeight: '700' }}
+                            />
+                          </View>
+                        ))}
+                      </View>
+                      <Text style={{ fontSize: 10, color: colors.muted, marginTop: 5, marginBottom: 10 }}>{t('price_marginHint')}</Text>
+
+                      {rows.length === 0 ? (
+                        <Text style={styles.emptyStateText}>{t('price_empty')}</Text>
+                      ) : (
+                        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                          {lossCount > 0 && (
+                            <Text style={[styles.chartCardBadge, { color: colors.red, backgroundColor: colors.redBg }]}>{t('price_summaryLoss', { count: lossCount })}</Text>
+                          )}
+                          {lowCount > 0 && (
+                            <Text style={[styles.chartCardBadge, { color: colors.amber, backgroundColor: colors.amberBg }]}>{t('price_summaryLow', { count: lowCount })}</Text>
+                          )}
+                          {lossCount === 0 && lowCount === 0 && (
+                            <Text style={{ fontSize: 11, fontWeight: '700', color: colors.greenDark }}>{t('price_summaryOk')}</Text>
+                          )}
+                        </View>
+                      )}
+
+                      {rows.map(r => {
+                        const { p } = r;
+                        const badge = statusStyle[r.status];
+                        const isExpanded = pricingExpandedId === p.productId;
+                        const discountPrice = p.sellingPrice * (1 - pricingDiscountPct / 100);
+                        const discountMargin = discountPrice - p.effectiveCost;
+                        return (
+                          <View key={p.productId} style={{ borderTopWidth: 1, borderTopColor: colors.border }}>
+                            <Pressable
+                              accessibilityRole="button"
+                              accessibilityState={{ expanded: isExpanded }}
+                              onPress={() => setPricingExpandedId(isExpanded ? null : p.productId)}
+                              style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 10 }}>
+                              <View style={{ flex: 1, minWidth: 0 }}>
+                                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                                  <Text style={{ flexShrink: 1, fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{p.productName}</Text>
+                                  <Text style={{ fontSize: 9, fontWeight: '800', color: badge.color, backgroundColor: badge.bg, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 10, overflow: 'hidden' }}>{badge.label}</Text>
+                                </View>
+                                <Text style={{ fontSize: 11, color: colors.muted, marginTop: 3 }}>
+                                  {t('price_costToPrice', { cost: money(p.costPrice), price: money(p.sellingPrice), unit: p.unit })}
+                                </Text>
+                              </View>
+                              {r.hasCost && (
+                                <View style={{ alignItems: 'flex-end' }}>
+                                  <Text style={{ fontSize: 13, fontWeight: '800', color: badge.color }}>{signed(r.afterWastage)}/{p.unit}</Text>
+                                  <Text style={{ fontSize: 10, color: colors.muted, marginTop: 2 }}>{Math.round(r.marginPct)}%</Text>
+                                </View>
+                              )}
+                              <Text style={{ fontSize: 12, color: colors.muted }}>{isExpanded ? '▲' : '▼'}</Text>
+                            </Pressable>
+
+                            {isExpanded && !r.hasCost && (
+                              <Text style={{ fontSize: 11, color: colors.muted, paddingBottom: 12 }}>{t('price_noCostHint')}</Text>
+                            )}
+                            {isExpanded && r.hasCost && (
+                              <View style={{ paddingBottom: 12 }}>
+                                <Text style={{ fontSize: 12, lineHeight: 17, color: colors.slate, marginBottom: 8 }}>
+                                  {t('price_explain', { name: p.productName, cost: money(p.costPrice), price: money(p.sellingPrice), unit: p.unit, margin: money(r.gross) })}
+                                </Text>
+                                {detailLine(t('price_grossMargin'), `${signed(r.gross)}/${p.unit}`)}
+                                {detailLine(t('price_afterWastage', { pct: Math.round(p.wastageRate * 100) }), `${signed(r.afterWastage)}/${p.unit}`, r.afterWastage < 0 ? colors.red : colors.navy)}
+                                {detailLine(t('price_afterExpenses', { pct: Math.round(expenseShare * 100) }), `${signed(r.afterExpenses)}/${p.unit}`, r.afterExpenses < 0 ? colors.red : colors.greenDark)}
+                                {p.avgSoldPrice != null && detailLine(t('price_avgSold'), `₹${money(p.avgSoldPrice)}/${p.unit}`)}
+
+                                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 8, padding: 10, borderRadius: 10, backgroundColor: colors.brandBg }}>
+                                  <View style={{ flex: 1 }}>
+                                    <Text style={{ fontSize: 10, fontWeight: '700', color: colors.brand }}>{t('price_suggested')}</Text>
+                                    <Text style={{ fontSize: 14, fontWeight: '800', color: colors.navy, marginTop: 2 }}>
+                                      ₹{money(r.rangeLow)}{r.rangeHigh > r.rangeLow ? ` – ₹${money(r.rangeHigh)}` : ''}/{p.unit}
+                                    </Text>
+                                  </View>
+                                  {p.sellingPrice < r.rangeLow && (
+                                    <Pressable
+                                      accessibilityRole="button"
+                                      onPress={() => handleApplySuggestedPrice(p, r.rangeHigh)}
+                                      disabled={!!pricingApplyingId}
+                                      style={[styles.primaryPillBtn, { opacity: pricingApplyingId ? 0.6 : 1 }]}>
+                                      <Text style={styles.primaryPillBtnText}>
+                                        {pricingApplyingId === p.productId ? t('common_updating') : t('price_setPrice', { price: money(r.rangeHigh) })}
+                                      </Text>
+                                    </Pressable>
+                                  )}
+                                </View>
+
+                                {p.sellingPrice > 0 && (
+                                  <View style={{ marginTop: 12 }}>
+                                    <Text style={{ fontSize: 11, fontWeight: '700', color: colors.slate, marginBottom: 6 }}>{t('price_discountHeading')}</Text>
+                                    <View style={[styles.modePillRow, { marginBottom: 8 }]}>
+                                      {[5, 10, 15, 20, 25].map(pct => (
+                                        <Pressable
+                                          key={pct}
+                                          accessibilityRole="button"
+                                          accessibilityState={{ selected: pricingDiscountPct === pct }}
+                                          onPress={() => setPricingDiscountPct(pct)}
+                                          style={[styles.modePill, pricingDiscountPct === pct && styles.modePillActive]}>
+                                          <Text style={[styles.modePillText, pricingDiscountPct === pct && styles.modePillTextActive]}>{pct}%</Text>
+                                        </Pressable>
+                                      ))}
+                                    </View>
+                                    <Text style={{ fontSize: 12, lineHeight: 17, color: discountMargin < 0 ? colors.red : colors.navy }}>
+                                      {discountMargin < 0
+                                        ? t('price_discountLoss', { pct: pricingDiscountPct, price: money(discountPrice), unit: p.unit, loss: money(-discountMargin) })
+                                        : t('price_discountResult', { pct: pricingDiscountPct, price: money(discountPrice), unit: p.unit, margin: money(discountMargin) })}
+                                    </Text>
+                                    {r.afterWastage > 0 && discountMargin > 0 && (
+                                      <Text style={{ fontSize: 11, color: colors.amber, marginTop: 3 }}>
+                                        {t('price_discountExtraSales', { pct: Math.ceil((r.afterWastage / discountMargin - 1) * 100) })}
+                                      </Text>
+                                    )}
+                                    {r.afterWastage > 0 && (
+                                      <Text style={{ fontSize: 11, color: colors.muted, marginTop: 3 }}>
+                                        {t('price_discountMax', { pct: Math.floor((r.afterWastage / p.sellingPrice) * 100) })}
+                                      </Text>
+                                    )}
+                                  </View>
+                                )}
+                              </View>
+                            )}
+                          </View>
+                        );
+                      })}
+                    </View>
+                  );
+                })()}
+              </View>
+
               <View style={styles.chartCard}>
                 <View style={styles.chartCardHeaderRow}>
                   <Text style={styles.chartCardTitle}>🏆 {t('ins_mostSelling')}</Text>
@@ -8731,37 +11373,178 @@ function CustomerAppContent() {
                 <Text style={styles.emptyStateText}>{t('dc_noVendorsYet')}</Text>
               )}
 
-              {vendors.map((v: any) => {
-                const due = v.totalDue || 0;
-                return (
-                  <Pressable
-                    key={v.vendorName}
-                    onPress={() => handleOpenVendorLedger(v.vendorName)}
-                    style={[styles.inventoryCard, { alignItems: 'center' }]}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.invItemName}>🏪 {v.vendorName}</Text>
-                      {!!v.mobileNumber && (
-                        <Text style={{ fontSize: 11, color: colors.slate, marginTop: 2 }}>📞 {v.mobileNumber}</Text>
+              {vendors.length > 0 && (
+                <View style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, overflow: 'hidden', backgroundColor: '#FFFFFF' }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 9, paddingVertical: 8, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                    <Pressable
+                      accessibilityRole="checkbox"
+                      accessibilityState={{ checked: vendors.length > 0 && vendors.every(vendor => selectedVendorNames.includes(vendor.vendorName)) }}
+                      accessibilityLabel={t('dc_selectAllVendors')}
+                      onPress={handleToggleAllVendors}
+                      style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
+                      <View style={{ width: 20, height: 20, alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1.5, borderColor: vendors.length > 0 && vendors.every(vendor => selectedVendorNames.includes(vendor.vendorName)) ? colors.brand : '#94A3B8', backgroundColor: vendors.length > 0 && vendors.every(vendor => selectedVendorNames.includes(vendor.vendorName)) ? colors.brand : '#FFFFFF' }}>
+                        {vendors.length > 0 && vendors.every(vendor => selectedVendorNames.includes(vendor.vendorName)) && <Text style={{ color: '#FFFFFF', fontSize: 14, lineHeight: 16, fontWeight: '800' }}>✓</Text>}
+                      </View>
+                      <Text style={{ fontSize: 10, fontWeight: '700', color: colors.slate }}>{t('dc_selectAllVendors')}</Text>
+                    </Pressable>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={{ fontSize: 10, color: colors.muted }}>{t('dc_selectedVendors', { count: selectedVendorNames.length })}</Text>
+                      {selectedVendorNames.length === 1 && (
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel={t('dc_editSelectedVendor')}
+                          onPress={handleEditSelectedVendor}
+                          style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#C7D2FE', borderRadius: 6, backgroundColor: colors.brandBg }}>
+                          <Text style={{ fontSize: 12 }}>✏️</Text>
+                        </Pressable>
                       )}
-                      <Text style={{ fontSize: 11, color: colors.muted, marginTop: 2 }}>
-                        {v.lastActivity ? t('dc_vendorLastActivity', { date: formatDisplayDate(v.lastActivity) }) : ''}
-                      </Text>
+                      {selectedVendorNames.length > 0 && (
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel={t('dc_deleteSelectedVendors')}
+                          onPress={handleDeleteSelectedVendors}
+                          style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: colors.redBorder, borderRadius: 6, backgroundColor: colors.redBg }}>
+                          <Text style={{ fontSize: 12 }}>🗑️</Text>
+                        </Pressable>
+                      )}
                     </View>
-                    <View style={{ alignItems: 'flex-end' }}>
-                      {due > 0 ? (
-                        <>
-                          <Text style={{ fontSize: 15, fontWeight: '800', color: colors.red }}>₹{due.toLocaleString()}</Text>
-                          <Text style={{ fontSize: 10, color: colors.muted }}>{t('dc_vendorDueShort')}</Text>
-                        </>
-                      ) : (
-                        <View style={[styles.stockBadge, styles.stockBadgeOk]}>
-                          <Text style={[styles.stockBadgeText, styles.stockBadgeTextOk]}>{t('dc_paidInFull')}</Text>
+                  </View>
+                  {vendors.map((vendor: any, index: number) => {
+                    const due = vendor.totalDue || 0;
+                    const selected = selectedVendorNames.includes(vendor.vendorName);
+                    return (
+                      <View key={vendor.vendorName} style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 9, paddingVertical: 8, borderBottomWidth: index < vendors.length - 1 ? 1 : 0, borderBottomColor: colors.border, backgroundColor: selected ? colors.brandBg : '#FFFFFF' }}>
+                        <Pressable
+                          accessibilityRole="checkbox"
+                          accessibilityState={{ checked: selected }}
+                          accessibilityLabel={vendor.vendorName}
+                          onPress={() => toggleVendorSelection(vendor.vendorName)}
+                          style={{ width: 30, height: 34, alignItems: 'flex-start', justifyContent: 'center' }}>
+                          <View style={{ width: 20, height: 20, alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1.5, borderColor: selected ? colors.brand : '#94A3B8', backgroundColor: selected ? colors.brand : '#FFFFFF' }}>
+                            {selected && <Text style={{ color: '#FFFFFF', fontSize: 14, lineHeight: 16, fontWeight: '800' }}>✓</Text>}
+                          </View>
+                        </Pressable>
+                        <Pressable onPress={() => handleOpenVendorLedger(vendor.vendorName)} style={{ flex: 1, minWidth: 0 }}>
+                          <Text style={{ fontSize: 12, fontWeight: '700', color: colors.navy }} numberOfLines={1}>🏪 {vendor.vendorName}</Text>
+                          {!!vendor.mobileNumber && <Text style={{ fontSize: 10, color: colors.slate, marginTop: 2 }}>📞 {vendor.mobileNumber}</Text>}
+                          {!!vendor.email && <Text style={{ fontSize: 9, color: colors.muted, marginTop: 1 }} numberOfLines={1}>{vendor.email}</Text>}
+                          {!!vendor.lastActivity && <Text style={{ fontSize: 9, color: colors.muted, marginTop: 1 }}>{formatDisplayDate(vendor.lastActivity)}</Text>}
+                        </Pressable>
+                        <View style={{ alignItems: 'flex-end', marginLeft: 8 }}>
+                          {due > 0 ? (
+                            <>
+                              <Text style={{ fontSize: 12, fontWeight: '800', color: colors.red }}>₹{due.toLocaleString()}</Text>
+                              <Text style={{ fontSize: 9, color: colors.muted }}>{t('dc_vendorDueShort')}</Text>
+                            </>
+                          ) : (
+                            <View style={[styles.stockBadge, styles.stockBadgeOk]}>
+                              <Text style={[styles.stockBadgeText, styles.stockBadgeTextOk, { fontSize: 9 }]}>{t('dc_paidInFull')}</Text>
+                            </View>
+                          )}
                         </View>
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+            </View>
+          )}
+
+          {/* Business Feature Tab: Customers (Fruit/Vegetable & Retailer) - Udhaar/credit book, receivables mirror of Vendors */}
+          {activeTab === 'customers' && (hasFeature('inventory') || hasFeature('products')) && (
+            <View>
+              <View style={styles.sectionHeaderRow}>
+                <Text style={styles.sectionHeading}>{t('nav_customers')}</Text>
+                <Pressable onPress={handleOpenAddInventoryCustomer} style={styles.primaryPillBtn}>
+                  <Text style={styles.primaryPillBtnText}>{t('dc_addCustomer')}</Text>
+                </Pressable>
+              </View>
+              <Text style={{ fontSize: 12, color: colors.muted, marginTop: -6, marginBottom: 14 }}>
+                {t('dc_customersSubtitle')}
+              </Text>
+
+              {customersLoading && customers.length === 0 && (
+                <ActivityIndicator color={colors.brand} style={{ marginVertical: 20 }} />
+              )}
+
+              {!customersLoading && customers.length === 0 && (
+                <Text style={styles.emptyStateText}>{t('dc_noCustomersYet')}</Text>
+              )}
+
+              {customers.length > 0 && (
+                <View style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, overflow: 'hidden', backgroundColor: '#FFFFFF' }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 9, paddingVertical: 8, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                    <Pressable
+                      accessibilityRole="checkbox"
+                      accessibilityState={{ checked: customers.length > 0 && customers.every(customer => selectedCustomerNames.includes(customer.customerName)) }}
+                      accessibilityLabel={t('dc_selectAllCustomers')}
+                      onPress={handleToggleAllCustomers}
+                      style={{ flexDirection: 'row', alignItems: 'center', gap: 7 }}>
+                      <View style={{ width: 20, height: 20, alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1.5, borderColor: customers.length > 0 && customers.every(customer => selectedCustomerNames.includes(customer.customerName)) ? colors.brand : '#94A3B8', backgroundColor: customers.length > 0 && customers.every(customer => selectedCustomerNames.includes(customer.customerName)) ? colors.brand : '#FFFFFF' }}>
+                        {customers.length > 0 && customers.every(customer => selectedCustomerNames.includes(customer.customerName)) && <Text style={{ color: '#FFFFFF', fontSize: 14, lineHeight: 16, fontWeight: '800' }}>✓</Text>}
+                      </View>
+                      <Text style={{ fontSize: 10, fontWeight: '700', color: colors.slate }}>{t('dc_selectAllCustomers')}</Text>
+                    </Pressable>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={{ fontSize: 10, color: colors.muted }}>{t('dc_selectedCustomers', { count: selectedCustomerNames.length })}</Text>
+                      {selectedCustomerNames.length === 1 && (
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel={t('dc_editSelectedCustomer')}
+                          onPress={handleEditSelectedCustomer}
+                          style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#C7D2FE', borderRadius: 6, backgroundColor: colors.brandBg }}>
+                          <Text style={{ fontSize: 12 }}>✏️</Text>
+                        </Pressable>
+                      )}
+                      {selectedCustomerNames.length > 0 && (
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel={t('dc_deleteSelectedCustomers')}
+                          onPress={handleDeleteSelectedCustomers}
+                          style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: colors.redBorder, borderRadius: 6, backgroundColor: colors.redBg }}>
+                          <Text style={{ fontSize: 12 }}>🗑️</Text>
+                        </Pressable>
                       )}
                     </View>
-                  </Pressable>
-                );
-              })}
+                  </View>
+                  {customers.map((customer: any, index: number) => {
+                    const due = customer.totalDue || 0;
+                    const selected = selectedCustomerNames.includes(customer.customerName);
+                    return (
+                      <View key={customer.customerName} style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 9, paddingVertical: 8, borderBottomWidth: index < customers.length - 1 ? 1 : 0, borderBottomColor: colors.border, backgroundColor: selected ? colors.brandBg : '#FFFFFF' }}>
+                        <Pressable
+                          accessibilityRole="checkbox"
+                          accessibilityState={{ checked: selected }}
+                          accessibilityLabel={customer.customerName}
+                          onPress={() => toggleCustomerSelection(customer.customerName)}
+                          style={{ width: 30, height: 34, alignItems: 'flex-start', justifyContent: 'center' }}>
+                          <View style={{ width: 20, height: 20, alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1.5, borderColor: selected ? colors.brand : '#94A3B8', backgroundColor: selected ? colors.brand : '#FFFFFF' }}>
+                            {selected && <Text style={{ color: '#FFFFFF', fontSize: 14, lineHeight: 16, fontWeight: '800' }}>✓</Text>}
+                          </View>
+                        </Pressable>
+                        <Pressable onPress={() => handleOpenCustomerLedger(customer.customerName)} style={{ flex: 1, minWidth: 0 }}>
+                          <Text style={{ fontSize: 12, fontWeight: '700', color: colors.navy }} numberOfLines={1}>🧑 {customer.customerName}</Text>
+                          {!!customer.mobileNumber && <Text style={{ fontSize: 10, color: colors.slate, marginTop: 2 }}>📞 {customer.mobileNumber}</Text>}
+                          {!!customer.email && <Text style={{ fontSize: 9, color: colors.muted, marginTop: 1 }} numberOfLines={1}>{customer.email}</Text>}
+                          {!!customer.lastActivity && <Text style={{ fontSize: 9, color: colors.muted, marginTop: 1 }}>{formatDisplayDate(customer.lastActivity)}</Text>}
+                        </Pressable>
+                        <View style={{ alignItems: 'flex-end', marginLeft: 8 }}>
+                          {due > 0 ? (
+                            <>
+                              <Text style={{ fontSize: 12, fontWeight: '800', color: colors.red }}>₹{due.toLocaleString()}</Text>
+                              <Text style={{ fontSize: 9, color: colors.muted }}>{t('dc_customerOwesShort')}</Text>
+                            </>
+                          ) : (
+                            <View style={[styles.stockBadge, styles.stockBadgeOk]}>
+                              <Text style={[styles.stockBadgeText, styles.stockBadgeTextOk, { fontSize: 9 }]}>{t('dc_paidInFull')}</Text>
+                            </View>
+                          )}
+                        </View>
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
             </View>
           )}
 
@@ -12353,6 +15136,21 @@ function CustomerAppContent() {
                   {[vendorLedger?.mobileNumber, vendorLedger?.email].filter(Boolean).join(' · ')}
                 </Text>
               )}
+              {vendorLedger && (
+                <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+                  <Pressable
+                    onPress={() => handleOpenEditParty('vendor')}
+                    style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingVertical: 6, paddingHorizontal: 12 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: colors.navy }}>✏️ {t('dc_editBtn')}</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => handleShareStatement('vendor')}
+                    disabled={statementExporting}
+                    style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingVertical: 6, paddingHorizontal: 12, opacity: statementExporting ? 0.6 : 1 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: colors.navy }}>📄 {t('dc_statementBtn')}</Text>
+                  </Pressable>
+                </View>
+              )}
 
               {vendorLedgerLoading && !vendorLedger && (
                 <ActivityIndicator color={colors.brand} style={{ marginVertical: 20 }} />
@@ -12380,14 +15178,51 @@ function CustomerAppContent() {
                   </View>
 
                   {(vendorLedger.totals?.totalDue || 0) > 0 && (
-                    <Pressable onPress={handleOpenPayVendor} style={[styles.primaryPillBtn, { alignItems: 'center', marginTop: 4, marginBottom: 16 }]}>
-                      <Text style={styles.primaryPillBtnText}>💸 {t('dc_payVendorBtn')}</Text>
+                    <Pressable onPress={() => handleOpenPayVendor()} style={[styles.primaryPillBtn, { alignItems: 'center', marginTop: 4, marginBottom: 8 }]}>
+                      <Text style={styles.primaryPillBtnText}>💸 {t('dc_payVendorBtn')} (₹{(vendorLedger.totals?.totalDue || 0).toLocaleString()})</Text>
+                    </Pressable>
+                  )}
+                  {(vendorLedger.totals?.totalDue || 0) > 0 && (
+                    <Pressable onPress={handleSendVendorDueMessage} style={[styles.primaryPillBtn, { alignItems: 'center', marginBottom: 16, backgroundColor: '#25D366' }]}>
+                      <Text style={styles.primaryPillBtnText}>💬 {t('dc_vendorDueWhatsappBtn')}</Text>
                     </Pressable>
                   )}
 
+                  {(() => {
+                    const pending = (vendorLedger.purchases || []).filter((p: any) => p.amountDue > 0);
+                    if (pending.length === 0) return null;
+                    return (
+                      <View style={{ marginBottom: 18 }}>
+                        <Text style={styles.chartCardTitle}>🔴 {t('dc_vendorPendingTitle')}</Text>
+                        <Text style={{ fontSize: 11, color: colors.muted, marginTop: 2, marginBottom: 10 }}>
+                          {t('dc_vendorPendingHint')}
+                        </Text>
+                        {pending.map((p: any) => (
+                          <View key={p.id} style={{
+                            flexDirection: 'row', alignItems: 'center', padding: 10, marginBottom: 8,
+                            backgroundColor: colors.redBg, borderWidth: 1, borderColor: colors.redBorder, borderRadius: 10,
+                          }}>
+                            <View style={{ flex: 1 }}>
+                              <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>
+                                {p.productName} <Text style={{ fontWeight: '500', color: colors.muted }}>({p.quantity} {p.unit})</Text>
+                              </Text>
+                              <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }}>{p.date}</Text>
+                            </View>
+                            <Text style={{ fontSize: 14, fontWeight: '800', color: colors.red, marginRight: 10 }}>₹{p.amountDue.toLocaleString()}</Text>
+                            <Pressable
+                              onPress={() => handleOpenPayVendor(p.amountDue, t('dc_vendorPayForNote', { product: p.productName, date: p.date }), p.id)}
+                              style={{ backgroundColor: colors.brand, borderRadius: 8, paddingVertical: 7, paddingHorizontal: 12 }}>
+                              <Text style={{ color: '#fff', fontSize: 12, fontWeight: '700' }}>{t('dc_vendorPayThis')}</Text>
+                            </Pressable>
+                          </View>
+                        ))}
+                      </View>
+                    );
+                  })()}
+
                   <Text style={styles.chartCardTitle}>📖 {t('dc_vendorPassbookTitle')}</Text>
                   {(() => {
-                    type PassbookRow = { key: string; date: string; icon: string; label: string; sub: string; delta: number };
+                    type PassbookRow = { key: string; date: string; icon: string; label: string; sub: string; delta: number; open?: boolean; onDelete?: () => void };
                     const rows: PassbookRow[] = [];
                     (vendorLedger.purchases || []).forEach((p: any) => {
                       rows.push({
@@ -12397,6 +15232,8 @@ function CustomerAppContent() {
                         label: `${t('dc_vendorGotEntry')}: ${p.productName}`,
                         sub: `${p.quantity} ${p.unit}`,
                         delta: p.totalCost,
+                        open: p.amountDue > 0,
+                        onDelete: () => handleDeletePassbookEntry('vendor', { kind: 'tx', id: p.id, amount: p.totalCost, productName: p.productName }),
                       });
                       if (p.amountPaid > 0) {
                         rows.push({
@@ -12417,6 +15254,7 @@ function CustomerAppContent() {
                         label: t('dc_vendorGaveEntry'),
                         sub: p.note ? `${p.paymentMethod} · ${p.note}` : p.paymentMethod,
                         delta: -p.amount,
+                        onDelete: () => handleDeletePassbookEntry('vendor', { kind: 'payment', id: p.id, amount: p.amount }),
                       });
                     });
                     if (rows.length === 0) {
@@ -12438,7 +15276,14 @@ function CustomerAppContent() {
                           }}>
                             <Text style={{ fontSize: 18, marginRight: 10 }}>{r.icon}</Text>
                             <View style={{ flex: 1 }}>
-                              <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{r.label}</Text>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                                <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{r.label}</Text>
+                                {r.open && (
+                                  <View style={{ backgroundColor: colors.redBg, borderWidth: 1, borderColor: colors.redBorder, borderRadius: 5, paddingHorizontal: 5, paddingVertical: 1 }}>
+                                    <Text style={{ fontSize: 9, fontWeight: '800', color: colors.red }}>{t('dc_vendorOpenTag')}</Text>
+                                  </View>
+                                )}
+                              </View>
                               <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }} numberOfLines={1}>{r.sub} · {r.date}</Text>
                             </View>
                             <View style={{ alignItems: 'flex-end' }}>
@@ -12449,6 +15294,13 @@ function CustomerAppContent() {
                                 {t('dc_vendorBalance')} ₹{r.balance.toLocaleString()}
                               </Text>
                             </View>
+                            {r.onDelete ? (
+                              <Pressable onPress={r.onDelete} hitSlop={8} style={{ marginLeft: 10, padding: 4 }}>
+                                <Text style={{ fontSize: 15, fontWeight: '700', color: colors.muted }}>✕</Text>
+                              </Pressable>
+                            ) : (
+                              <View style={{ width: 33 }} />
+                            )}
                           </View>
                         ))}
                       </View>
@@ -12514,6 +15366,517 @@ function CustomerAppContent() {
                 style={[styles.modalSubmitBtn, payVendorLoading && { opacity: 0.6 }]}>
                 <Text style={styles.modalSubmitBtnText}>{payVendorLoading ? t('common_saving') : t('dc_payVendorBtn')}</Text>
               </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Add Customer - proactively save a regular customer's contact details */}
+        <Modal visible={showAddCustomerModal} animationType="slide" transparent onRequestClose={() => setShowAddCustomerModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>🧑 {t('dc_addCustomerTitle')}</Text>
+                <Pressable onPress={() => setShowAddCustomerModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_customerNameLabel')}</Text>
+              <TextInput
+                placeholder={t('dc_customerNamePlaceholder')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newCustomerName}
+                onChangeText={setNewCustomerName}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorMobileLabel')}</Text>
+              <TextInput
+                keyboardType="phone-pad"
+                placeholder="e.g. 9876543210"
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newCustomerMobile}
+                onChangeText={setNewCustomerMobile}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorEmailLabel')}</Text>
+              <TextInput
+                keyboardType="email-address"
+                autoCapitalize="none"
+                placeholder="e.g. priya@example.com"
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newCustomerEmail}
+                onChangeText={setNewCustomerEmail}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorAddressLabel')}</Text>
+              <TextInput
+                placeholder={t('dc_vendorAddressPlaceholder')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newCustomerAddress}
+                onChangeText={setNewCustomerAddress}
+              />
+
+              <Pressable
+                onPress={handleAddCustomer}
+                disabled={addCustomerLoading}
+                style={[styles.modalSubmitBtn, addCustomerLoading && { opacity: 0.6 }]}>
+                <Text style={styles.modalSubmitBtnText}>{addCustomerLoading ? t('common_saving') : t('dc_addCustomer')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Customer Ledger - all credit sales to + payments from one customer, with running due */}
+        <Modal visible={showCustomerLedgerModal} animationType="slide" transparent onRequestClose={() => setShowCustomerLedgerModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>🧑 {customerLedgerName}</Text>
+                <Pressable onPress={() => setShowCustomerLedgerModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              {!!(customerLedger?.mobileNumber || customerLedger?.email) && (
+                <Text style={{ fontSize: 12, color: colors.muted, marginTop: -8, marginBottom: 10 }}>
+                  {[customerLedger?.mobileNumber, customerLedger?.email].filter(Boolean).join(' · ')}
+                </Text>
+              )}
+              {customerLedger && (
+                <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+                  <Pressable
+                    onPress={() => handleOpenEditParty('customer')}
+                    style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingVertical: 6, paddingHorizontal: 12 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: colors.navy }}>✏️ {t('dc_editBtn')}</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => handleShareStatement('customer')}
+                    disabled={statementExporting}
+                    style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingVertical: 6, paddingHorizontal: 12, opacity: statementExporting ? 0.6 : 1 }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: colors.navy }}>📄 {t('dc_statementBtn')}</Text>
+                  </Pressable>
+                </View>
+              )}
+
+              {customerLedgerLoading && !customerLedger && (
+                <ActivityIndicator color={colors.brand} style={{ marginVertical: 20 }} />
+              )}
+
+              {customerLedger && (
+                <ScrollView style={{ maxHeight: 480 }}>
+                  <View style={styles.kpiRow}>
+                    <View style={styles.kpiCard}>
+                      <Text style={styles.kpiLabel}>{t('dc_customerTotalSold')}</Text>
+                      <Text style={[styles.kpiValue, { color: colors.brand }]}>₹{(customerLedger.totals?.totalSold || 0).toLocaleString()}</Text>
+                    </View>
+                    <View style={styles.kpiCard}>
+                      <Text style={styles.kpiLabel}>{t('dc_customerTotalReceived')}</Text>
+                      <Text style={[styles.kpiValue, styles.textPositive]}>₹{(customerLedger.totals?.totalReceived || 0).toLocaleString()}</Text>
+                    </View>
+                  </View>
+                  <View style={styles.kpiRow}>
+                    <View style={[styles.kpiCard, { flex: 1 }]}>
+                      <Text style={styles.kpiLabel}>{t('dc_customerTotalDue')}</Text>
+                      <Text style={[styles.kpiValue, (customerLedger.totals?.totalDue || 0) > 0 ? styles.textNegative : styles.textPositive]}>
+                        ₹{(customerLedger.totals?.totalDue || 0).toLocaleString()}
+                      </Text>
+                    </View>
+                  </View>
+
+                  {(customerLedger.totals?.totalDue || 0) > 0 && (
+                    <Pressable onPress={() => handleOpenPayCustomer()} style={[styles.primaryPillBtn, { alignItems: 'center', marginTop: 4, marginBottom: 8 }]}>
+                      <Text style={styles.primaryPillBtnText}>💰 {t('dc_collectBtn')} (₹{(customerLedger.totals?.totalDue || 0).toLocaleString()})</Text>
+                    </Pressable>
+                  )}
+                  {(customerLedger.totals?.totalDue || 0) > 0 && (
+                    <Pressable onPress={handleSendCustomerReminder} style={[styles.primaryPillBtn, { alignItems: 'center', marginBottom: 16, backgroundColor: '#25D366' }]}>
+                      <Text style={styles.primaryPillBtnText}>💬 {t('dc_remindWhatsappBtn')}</Text>
+                    </Pressable>
+                  )}
+
+                  {(() => {
+                    const pending = (customerLedger.sales || []).filter((s: any) => s.amountDue > 0);
+                    if (pending.length === 0) return null;
+                    return (
+                      <View style={{ marginBottom: 18 }}>
+                        <Text style={styles.chartCardTitle}>🔴 {t('dc_vendorPendingTitle')}</Text>
+                        <Text style={{ fontSize: 11, color: colors.muted, marginTop: 2, marginBottom: 10 }}>
+                          {t('dc_customerPendingHint')}
+                        </Text>
+                        {pending.map((s: any) => (
+                          <View key={s.id} style={{
+                            flexDirection: 'row', alignItems: 'center', padding: 10, marginBottom: 8,
+                            backgroundColor: colors.redBg, borderWidth: 1, borderColor: colors.redBorder, borderRadius: 10,
+                          }}>
+                            <View style={{ flex: 1 }}>
+                              <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>
+                                {s.productName} <Text style={{ fontWeight: '500', color: colors.muted }}>({s.quantity} {s.unit})</Text>
+                              </Text>
+                              <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }}>{s.date}</Text>
+                            </View>
+                            <Text style={{ fontSize: 14, fontWeight: '800', color: colors.red, marginRight: 10 }}>₹{s.amountDue.toLocaleString()}</Text>
+                            <Pressable
+                              onPress={() => handleOpenPayCustomer(s.amountDue, t('dc_vendorPayForNote', { product: s.productName, date: s.date }), s.id)}
+                              style={{ backgroundColor: colors.brand, borderRadius: 8, paddingVertical: 7, paddingHorizontal: 12 }}>
+                              <Text style={{ color: '#fff', fontSize: 12, fontWeight: '700' }}>{t('dc_vendorPayThis')}</Text>
+                            </Pressable>
+                          </View>
+                        ))}
+                      </View>
+                    );
+                  })()}
+
+                  <Text style={styles.chartCardTitle}>📖 {t('dc_vendorPassbookTitle')}</Text>
+                  {(() => {
+                    type PassbookRow = { key: string; date: string; icon: string; label: string; sub: string; delta: number; open?: boolean; onDelete?: () => void };
+                    const rows: PassbookRow[] = [];
+                    (customerLedger.sales || []).forEach((s: any) => {
+                      rows.push({
+                        key: `sale-${s.id}`,
+                        date: s.date,
+                        icon: '📤',
+                        label: `${t('dc_customerTookEntry')}: ${s.productName}`,
+                        sub: `${s.quantity} ${s.unit}`,
+                        delta: s.totalAmount,
+                        open: s.amountDue > 0,
+                        onDelete: () => handleDeletePassbookEntry('customer', { kind: 'tx', id: s.id, amount: s.totalAmount, productName: s.productName }),
+                      });
+                      if (s.amountPaid > 0) {
+                        rows.push({
+                          key: `sale-paid-${s.id}`,
+                          date: s.date,
+                          icon: '💵',
+                          label: t('dc_customerPaidEntry'),
+                          sub: t('dc_vendorPaidAtPurchase'),
+                          delta: -s.amountPaid,
+                        });
+                      }
+                    });
+                    (customerLedger.payments || []).forEach((p: any) => {
+                      rows.push({
+                        key: `payment-${p.id}`,
+                        date: p.date,
+                        icon: '💰',
+                        label: t('dc_customerPaidEntry'),
+                        sub: p.note ? `${p.paymentMethod} · ${p.note}` : p.paymentMethod,
+                        delta: -p.amount,
+                        onDelete: () => handleDeletePassbookEntry('customer', { kind: 'payment', id: p.id, amount: p.amount }),
+                      });
+                    });
+                    if (rows.length === 0) {
+                      return <Text style={styles.emptyStateText}>{t('dc_noVendorActivity')}</Text>;
+                    }
+                    rows.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+                    let running = 0;
+                    const withBalance = rows.map(r => {
+                      running += r.delta;
+                      return { ...r, balance: running };
+                    });
+                    withBalance.reverse();
+                    return (
+                      <View style={{ marginTop: 8 }}>
+                        {withBalance.map(r => (
+                          <View key={r.key} style={{
+                            flexDirection: 'row', alignItems: 'center', paddingVertical: 10,
+                            borderBottomWidth: 1, borderBottomColor: colors.border,
+                          }}>
+                            <Text style={{ fontSize: 18, marginRight: 10 }}>{r.icon}</Text>
+                            <View style={{ flex: 1 }}>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                                <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>{r.label}</Text>
+                                {r.open && (
+                                  <View style={{ backgroundColor: colors.redBg, borderWidth: 1, borderColor: colors.redBorder, borderRadius: 5, paddingHorizontal: 5, paddingVertical: 1 }}>
+                                    <Text style={{ fontSize: 9, fontWeight: '800', color: colors.red }}>{t('dc_vendorOpenTag')}</Text>
+                                  </View>
+                                )}
+                              </View>
+                              <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }} numberOfLines={1}>{r.sub} · {r.date}</Text>
+                            </View>
+                            <View style={{ alignItems: 'flex-end' }}>
+                              <Text style={{ fontSize: 14, fontWeight: '800', color: r.delta >= 0 ? '#B45309' : colors.greenDark }}>
+                                {r.delta >= 0 ? '+' : '−'}₹{Math.abs(r.delta).toLocaleString()}
+                              </Text>
+                              <Text style={{ fontSize: 10, color: colors.muted, marginTop: 1 }}>
+                                {t('dc_vendorBalance')} ₹{r.balance.toLocaleString()}
+                              </Text>
+                            </View>
+                            {r.onDelete ? (
+                              <Pressable onPress={r.onDelete} hitSlop={8} style={{ marginLeft: 10, padding: 4 }}>
+                                <Text style={{ fontSize: 15, fontWeight: '700', color: colors.muted }}>✕</Text>
+                              </Pressable>
+                            ) : (
+                              <View style={{ width: 33 }} />
+                            )}
+                          </View>
+                        ))}
+                      </View>
+                    );
+                  })()}
+                </ScrollView>
+              )}
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Collect From Customer - record a payment received, reducing their due balance */}
+        <Modal visible={showPayCustomerModal} animationType="slide" transparent onRequestClose={() => setShowPayCustomerModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>💰 {t('dc_collectFromTitle', { customer: customerLedgerName })}</Text>
+                <Pressable onPress={() => setShowPayCustomerModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_amountLabel')}</Text>
+              <TextInput
+                keyboardType="numeric"
+                placeholder="e.g. 500"
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={payCustomerAmount}
+                onChangeText={setPayCustomerAmount}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_paymentMethod')}</Text>
+              <View style={styles.modePillRow}>
+                {([
+                  { key: 'CASH' as const, label: t('common_cash') },
+                  { key: 'UPI' as const, label: t('common_upi') },
+                  { key: 'CREDIT' as const, label: t('common_credit') },
+                ]).map(pm => (
+                  <Pressable
+                    key={pm.key}
+                    onPress={() => setPayCustomerMethod(pm.key)}
+                    style={[styles.modePill, payCustomerMethod === pm.key && styles.modePillActive]}>
+                    <Text style={[styles.modePillText, payCustomerMethod === pm.key && styles.modePillTextActive]}>
+                      {pm.label}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_noteOptional')}</Text>
+              <TextInput
+                placeholder={t('dc_notePlaceholder')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={payCustomerNote}
+                onChangeText={setPayCustomerNote}
+              />
+
+              <Pressable
+                onPress={handleRecordCustomerPayment}
+                disabled={payCustomerLoading}
+                style={[styles.modalSubmitBtn, payCustomerLoading && { opacity: 0.6 }]}>
+                <Text style={styles.modalSubmitBtnText}>{payCustomerLoading ? t('common_saving') : t('dc_collectBtn')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Edit Entry - correct the quantity, amount, paid amount or date of a recorded entry */}
+        <Modal visible={!!editTx} animationType="slide" transparent onRequestClose={() => setEditTx(null)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading} numberOfLines={1}>✏️ {t('dc_editTxTitle')}: {editTx?.productName}</Text>
+                <Pressable onPress={() => setEditTx(null)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_editQty')}{editTx?.unit ? ` (${editTx.unit})` : ''}</Text>
+              <TextInput keyboardType="numeric" placeholderTextColor={colors.muted} style={styles.modalInput} value={editTxQuantity} onChangeText={setEditTxQuantity} />
+
+              <Text style={styles.fieldLabel}>{t('dc_amountLabel')}</Text>
+              <TextInput keyboardType="numeric" placeholderTextColor={colors.muted} style={styles.modalInput} value={editTxAmount} onChangeText={setEditTxAmount} />
+
+              {editTxPartPayable && (
+                <>
+                  <Text style={styles.fieldLabel}>{t('dc_editPaid')}</Text>
+                  <TextInput keyboardType="numeric" placeholderTextColor={colors.muted} style={styles.modalInput} value={editTxPaid} onChangeText={setEditTxPaid} />
+                </>
+              )}
+
+              <Text style={styles.fieldLabel}>{t('dc_editDate')}</Text>
+              <TextInput placeholder="2026-01-31" placeholderTextColor={colors.muted} style={styles.modalInput} value={editTxDate} onChangeText={setEditTxDate} />
+
+              <Pressable
+                onPress={handleSaveEditTransaction}
+                disabled={editTxSaving}
+                style={[styles.modalSubmitBtn, editTxSaving && { opacity: 0.6 }]}>
+                <Text style={styles.modalSubmitBtnText}>{editTxSaving ? t('common_saving') : t('common_save')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Edit Vendor / Customer - rename or update contact details; history follows the new name */}
+        <Modal visible={!!editParty} animationType="slide" transparent onRequestClose={() => setEditParty(null)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>✏️ {t(editParty?.side === 'vendor' ? 'dc_editVendorTitle' : 'dc_editCustomerTitle')}</Text>
+                <Pressable onPress={() => setEditParty(null)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.fieldLabel}>{t(editParty?.side === 'vendor' ? 'dc_vendorNameLabel' : 'dc_customerNameLabel')}</Text>
+              <TextInput placeholderTextColor={colors.muted} style={styles.modalInput} value={editPartyName} onChangeText={setEditPartyName} />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorMobileLabel')}</Text>
+              <TextInput keyboardType="phone-pad" placeholder="e.g. 9876543210" placeholderTextColor={colors.muted} style={styles.modalInput} value={editPartyMobile} onChangeText={setEditPartyMobile} />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorEmailLabel')}</Text>
+              <TextInput keyboardType="email-address" autoCapitalize="none" placeholderTextColor={colors.muted} style={styles.modalInput} value={editPartyEmail} onChangeText={setEditPartyEmail} />
+
+              <Text style={styles.fieldLabel}>{t('dc_vendorAddressLabel')}</Text>
+              <TextInput placeholder={t('dc_vendorAddressPlaceholder')} placeholderTextColor={colors.muted} style={styles.modalInput} value={editPartyAddress} onChangeText={setEditPartyAddress} />
+
+              <Pressable
+                onPress={handleSaveEditParty}
+                disabled={editPartySaving}
+                style={[styles.modalSubmitBtn, editPartySaving && { opacity: 0.6 }]}>
+                <Text style={styles.modalSubmitBtnText}>{editPartySaving ? t('common_saving') : t('common_save')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Add Expense - daily business costs not tied to a specific product */}
+        <Modal visible={showAddExpenseModal} animationType="slide" transparent onRequestClose={() => setShowAddExpenseModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>🧾 {t('dc_addExpenseTitle')}</Text>
+                <Pressable onPress={() => setShowAddExpenseModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_expenseCategoryLabel')}</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+                {(['Transport', 'Rent', 'Labor', 'Electricity', 'Other']).map(cat => (
+                  <Pressable
+                    key={cat}
+                    onPress={() => setNewExpenseCategory(cat)}
+                    style={[styles.modePill, newExpenseCategory === cat && styles.modePillActive]}>
+                    <Text style={[styles.modePillText, newExpenseCategory === cat && styles.modePillTextActive]}>{cat}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              <TextInput
+                placeholder={t('dc_expenseCategoryPlaceholder')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newExpenseCategory}
+                onChangeText={setNewExpenseCategory}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_amountLabel')}</Text>
+              <TextInput
+                keyboardType="numeric"
+                placeholder="e.g. 150"
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newExpenseAmount}
+                onChangeText={setNewExpenseAmount}
+              />
+
+              <Text style={styles.fieldLabel}>{t('dc_paymentMethod')}</Text>
+              <View style={styles.modePillRow}>
+                {([
+                  { key: 'CASH' as const, label: t('common_cash') },
+                  { key: 'UPI' as const, label: t('common_upi') },
+                  { key: 'CREDIT' as const, label: t('common_credit') },
+                ]).map(pm => (
+                  <Pressable
+                    key={pm.key}
+                    onPress={() => setNewExpensePaymentMethod(pm.key)}
+                    style={[styles.modePill, newExpensePaymentMethod === pm.key && styles.modePillActive]}>
+                    <Text style={[styles.modePillText, newExpensePaymentMethod === pm.key && styles.modePillTextActive]}>
+                      {pm.label}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              <Text style={styles.fieldLabel}>{t('dc_noteOptional')}</Text>
+              <TextInput
+                placeholder={t('dc_expenseNotePlaceholder')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={newExpenseNote}
+                onChangeText={setNewExpenseNote}
+              />
+
+              <Pressable
+                onPress={handleAddExpense}
+                disabled={addExpenseLoading}
+                style={[styles.modalSubmitBtn, { backgroundColor: '#D97706' }, addExpenseLoading && { opacity: 0.6 }]}>
+                <Text style={styles.modalSubmitBtnText}>{addExpenseLoading ? t('common_saving') : t('dc_addExpense')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Price Trend - selling price per unit over a product's recent sales */}
+        <Modal visible={showPriceTrendModal} animationType="slide" transparent onRequestClose={() => setShowPriceTrendModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>📈 {priceTrend?.productName ? t('dc_priceTrendTitleFor', { product: priceTrend.productName }) : t('dc_priceTrendTitle')}</Text>
+                <Pressable onPress={() => setShowPriceTrendModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+
+              {priceTrendLoading && !priceTrend && (
+                <ActivityIndicator color={colors.brand} style={{ marginVertical: 20 }} />
+              )}
+
+              {priceTrend && (
+                <ScrollView style={{ maxHeight: 440 }}>
+                  <Text style={{ fontSize: 12, color: colors.muted, marginBottom: 14 }}>
+                    {t('dc_priceTrendSubtitle', { price: priceTrend.currentSellingPrice, unit: priceTrend.unit })}
+                  </Text>
+                  {(priceTrend.points || []).length === 0 ? (
+                    <Text style={styles.emptyStateText}>{t('dc_priceTrendEmpty')}</Text>
+                  ) : (
+                    (() => {
+                      const points = priceTrend.points as { date: string; label: string; pricePerUnit: number }[];
+                      const max = Math.max(...points.map(p => p.pricePerUnit), 1);
+                      return (
+                        <View>
+                          {points.slice().reverse().map((p) => (
+                            <View key={p.date} style={styles.rankRow}>
+                              <View style={{ width: 46 }}>
+                                <Text style={{ fontSize: 11, color: colors.muted }}>{p.label}</Text>
+                              </View>
+                              <View style={{ flex: 1 }}>
+                                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+                                  <Text style={styles.rankAmount}>₹{p.pricePerUnit}/{priceTrend.unit}</Text>
+                                </View>
+                                <View style={styles.rankTrack}>
+                                  <View style={[styles.rankFill, { width: `${Math.max((p.pricePerUnit / max) * 100, 4)}%`, backgroundColor: colors.brand }]}>
+                                    <View style={styles.rankFillSheen} />
+                                  </View>
+                                </View>
+                              </View>
+                            </View>
+                          ))}
+                        </View>
+                      );
+                    })()
+                  )}
+                </ScrollView>
+              )}
             </View>
           </View>
         </Modal>
@@ -12883,22 +16246,29 @@ function CustomerAppContent() {
                   <Text style={styles.modalCloseText}>✕</Text>
                 </Pressable>
               </View>
-              {driverQr && (
+              {shownDriverQr && (
                 <View style={{ alignItems: 'center', backgroundColor: '#fff', borderRadius: 12, padding: 14, marginBottom: 14 }}>
-                  <Image source={{ uri: driverQr }} style={{ width: '100%', aspectRatio: 1, maxWidth: 340 }} resizeMode="contain" />
+                  <Image source={{ uri: shownDriverQr }} style={{ width: '100%', aspectRatio: merchantQrUrl ? 0.7 : 1, maxWidth: 340 }} resizeMode="contain" />
                 </View>
               )}
-              <Pressable onPress={() => handleOpenQuickPayment('UPI')} style={styles.modalSubmitBtn}>
-                <Text style={styles.modalSubmitBtnText}>{t('drv_recordUpiLong')}</Text>
-              </Pressable>
-              <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
-                <Pressable onPress={handlePickQr} style={[styles.actionBtnOutline, { flex: 1 }]}>
-                  <Text style={styles.actionBtnOutlineText}>{t('drv_replaceQr')}</Text>
-                </Pressable>
-                <Pressable onPress={handleRemoveQr} style={[styles.actionBtnOutline, { flex: 1, borderColor: colors.redBorder }]}>
-                  <Text style={[styles.actionBtnOutlineText, { color: colors.red }]}>{t('drv_removeQr')}</Text>
-                </Pressable>
-              </View>
+              {merchantQrUrl ? (
+                // Generated QR: payments on it are recorded by the server, nothing to enter or replace here.
+                <Text style={{ fontSize: 12, color: colors.muted, textAlign: 'center' }}>{t('drv_mchQrHint')}</Text>
+              ) : (
+                <>
+                  <Pressable onPress={() => handleOpenQuickPayment('UPI')} style={styles.modalSubmitBtn}>
+                    <Text style={styles.modalSubmitBtnText}>{t('drv_recordUpiLong')}</Text>
+                  </Pressable>
+                  <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
+                    <Pressable onPress={handlePickQr} style={[styles.actionBtnOutline, { flex: 1 }]}>
+                      <Text style={styles.actionBtnOutlineText}>{t('drv_replaceQr')}</Text>
+                    </Pressable>
+                    <Pressable onPress={handleRemoveQr} style={[styles.actionBtnOutline, { flex: 1, borderColor: colors.redBorder }]}>
+                      <Text style={[styles.actionBtnOutlineText, { color: colors.red }]}>{t('drv_removeQr')}</Text>
+                    </Pressable>
+                  </View>
+                </>
+              )}
             </View>
           </View>
         </Modal>
@@ -12959,6 +16329,123 @@ function CustomerAppContent() {
                   (quickPaymentSaving || (!!voiceTranscript && !voiceConfirmed)) && { opacity: 0.5 },
                 ]}>
                 <Text style={styles.modalSubmitBtnText}>{quickPaymentSaving ? t('common_saving') : t('common_save')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: End-of-day summary (Auto Driver) */}
+        <Modal visible={showDaySummary} animationType="fade" transparent onRequestClose={() => setShowDaySummary(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>📋 {t('drv_sumTitle')}</Text>
+                <Pressable onPress={() => setShowDaySummary(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              {showDaySummary && getDaySummaryRows().map(row => (
+                <View key={row.label} style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                  <Text style={{ fontSize: 13, color: colors.slate }}>{row.label}</Text>
+                  <Text style={{ fontSize: 14, fontWeight: '800', color: row.tone === 'good' ? colors.green : row.tone === 'bad' ? colors.red : colors.navy }}>
+                    {row.value}
+                  </Text>
+                </View>
+              ))}
+              <Pressable onPress={handleShareDaySummary} style={[styles.modalSubmitBtn, { marginTop: 16 }]}>
+                <Text style={styles.modalSubmitBtnText}>{t('drv_sumShare')}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Modal: Quick Fuel Expense (Auto Driver) */}
+        <Modal visible={showQuickFuelModal} animationType="fade" transparent onRequestClose={() => setShowQuickFuelModal(false)}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeaderRow}>
+                <Text style={styles.modalHeading}>⛽ {t('drv_fuelQuickTitle')}</Text>
+                <Pressable onPress={() => setShowQuickFuelModal(false)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              <Text style={styles.fieldLabel}>{t('drv_cashAmount')}</Text>
+              <TextInput
+                autoFocus
+                keyboardType="numeric"
+                placeholder={t('drv_cashAmountPh')}
+                placeholderTextColor={colors.muted}
+                style={styles.modalInput}
+                value={quickFuelAmount}
+                onChangeText={setQuickFuelAmount}
+              />
+              <Text style={[styles.fieldLabel, { marginTop: 12 }]}>{t('veh_fuelType')}</Text>
+              <View style={{ flexDirection: 'row', gap: 18, marginBottom: 2 }}>
+                {(['CNG', 'Petrol', 'Other'] as const).map(type => (
+                  <Pressable
+                    key={type}
+                    onPress={() => setQuickFuelType(type)}
+                    accessibilityRole="radio"
+                    accessibilityState={{ selected: quickFuelType === type }}
+                    hitSlop={6}
+                    style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 4 }}>
+                    <View style={{
+                      width: 18, height: 18, borderRadius: 9, borderWidth: 2, alignItems: 'center', justifyContent: 'center',
+                      borderColor: quickFuelType === type ? colors.brand : colors.border,
+                    }}>
+                      {quickFuelType === type && <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: colors.brand }} />}
+                    </View>
+                    <Text style={{ fontSize: 13, fontWeight: '600', color: colors.navy }}>
+                      {type === 'CNG' ? 'CNG' : type === 'Petrol' ? t('drv_fuelPetrol') : t('drv_fuelOther')}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              <Text style={[styles.fieldLabel, { marginTop: 12 }]}>{t('drv_fuelPaidBy')}</Text>
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                {(['Cash', 'UPI'] as const).map(mode => (
+                  <Pressable
+                    key={mode}
+                    onPress={() => setQuickFuelMode(mode)}
+                    style={{
+                      flex: 1, borderRadius: 8, paddingVertical: 9, alignItems: 'center', borderWidth: 1,
+                      borderColor: quickFuelMode === mode ? colors.brand : colors.border,
+                      backgroundColor: quickFuelMode === mode ? colors.brandBg : colors.panel,
+                    }}>
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: quickFuelMode === mode ? colors.brand : colors.slate }}>
+                      {mode === 'Cash' ? `💵 ${t('drv_recordCash')}` : '💳 UPI'}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              <Text style={{ fontSize: 12, color: colors.muted, marginTop: 10 }}>
+                {quickFuelMode === 'UPI' ? t('drv_fuelUpiPick') : t('drv_fuelCashHint')}
+              </Text>
+              {quickFuelMode === 'UPI' && (
+                <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
+                  {UPI_PAY_APPS.map(app => (
+                    <Pressable
+                      key={app.name}
+                      onPress={() => handlePayFuelWithApp(app)}
+                      accessibilityRole="button"
+                      accessibilityLabel={app.name}
+                      style={{
+                        flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+                        borderWidth: 1, borderColor: colors.border, borderRadius: 10, paddingVertical: 10, backgroundColor: colors.panel,
+                      }}>
+                      <View style={{ width: 28, height: 28, borderRadius: 14, backgroundColor: app.color, alignItems: 'center', justifyContent: 'center' }}>
+                        <Text style={{ color: '#fff', fontSize: 12, fontWeight: '800' }}>{app.mark}</Text>
+                      </View>
+                      <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }}>{app.name}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              )}
+              <Pressable
+                onPress={handleSaveQuickFuel}
+                disabled={quickFuelSaving}
+                style={[styles.modalSubmitBtn, { marginTop: 16 }, quickFuelSaving && { opacity: 0.5 }]}>
+                <Text style={styles.modalSubmitBtnText}>{quickFuelSaving ? t('common_saving') : t('common_save')}</Text>
               </Pressable>
             </View>
           </View>
@@ -13338,8 +16825,8 @@ function CustomerAppContent() {
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <View style={styles.modalHeaderRow}>
-                <Text style={styles.modalHeading}>🍎 {t('inv_addProductTitle')}</Text>
-                <Pressable onPress={() => setShowAddProductModal(false)}>
+                <Text style={styles.modalHeading}>{editingProductId ? `✏️ ${t('inv_editProductTitle')}` : `🍎 ${t('inv_addProductTitle')}`}</Text>
+                <Pressable onPress={editingProductId ? handleCloseProductForm : () => setShowAddProductModal(false)}>
                   <Text style={styles.modalCloseText}>✕</Text>
                 </Pressable>
               </View>
@@ -13387,7 +16874,7 @@ function CustomerAppContent() {
 
               <View style={{ flexDirection: 'row', gap: 10 }}>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.fieldLabel}>{t('inv_openingStock')}</Text>
+                  <Text style={styles.fieldLabel}>{t(editingProductId ? 'inv_stockQtyLabel' : 'inv_openingStock')}</Text>
                   <TextInput
                     keyboardType="numeric"
                     placeholder="e.g. 50"
@@ -13600,7 +17087,10 @@ function CustomerAppContent() {
               )}
 
               <Text style={styles.fieldLabel}>
-                {saleType === 'WASTAGE' ? t('dc_reasonOptional') : saleType === 'PURCHASE' ? t('dc_vendorNameLabel') : t('dc_noteOptional')}
+                {saleType === 'WASTAGE' ? t('dc_reasonOptional')
+                  : saleType === 'PURCHASE' ? t('dc_vendorNameLabel')
+                  : (saleType === 'SALE' && salePaymentMethod === 'CREDIT') ? t('dc_customerNameLabel')
+                  : t('dc_noteOptional')}
               </Text>
               {saleType === 'PURCHASE' ? (
                 <>
@@ -13640,6 +17130,47 @@ function CustomerAppContent() {
                     );
                   })()}
                 </>
+              ) : (saleType === 'SALE' && salePaymentMethod === 'CREDIT') ? (
+                <>
+                  <View style={{ flexDirection: 'row', gap: 8 }}>
+                    <TextInput
+                      placeholder={t('dc_customerNamePlaceholder')}
+                      placeholderTextColor={colors.muted}
+                      style={[styles.modalInput, { flex: 1 }]}
+                      value={saleNote}
+                      onChangeText={text => { setSaleNote(text); setShowCustomerPicker(true); }}
+                      onFocus={() => setShowCustomerPicker(true)}
+                    />
+                    <Pressable
+                      onPress={() => setShowCustomerPicker(prev => !prev)}
+                      style={{
+                        width: 46, height: 46, borderRadius: 10, alignItems: 'center', justifyContent: 'center',
+                        backgroundColor: colors.brandBg, borderWidth: 1, borderColor: '#C7D2FE',
+                      }}>
+                      <Text style={{ fontSize: 14, color: colors.brand }}>{showCustomerPicker ? '▲' : '▼'}</Text>
+                    </Pressable>
+                  </View>
+                  {showCustomerPicker && (() => {
+                    const query = saleNote.trim().toLowerCase();
+                    const matches = customers.filter((c: any) => !query || c.customerName.toLowerCase().includes(query));
+                    if (matches.length === 0) return null;
+                    return (
+                      <View style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, marginTop: 6, marginBottom: 10, overflow: 'hidden' }}>
+                        {matches.map((c: any) => (
+                          <Pressable
+                            key={c.customerName}
+                            onPress={() => { setSaleNote(c.customerName); setShowCustomerPicker(false); }}
+                            style={{ paddingVertical: 10, paddingHorizontal: 12, backgroundColor: c.customerName === saleNote ? '#EEF2FF' : '#fff' }}>
+                            <Text style={{ color: colors.navy }}>🧑 {c.customerName}</Text>
+                          </Pressable>
+                        ))}
+                      </View>
+                    );
+                  })()}
+                  <Text style={{ fontSize: 11, color: colors.muted, marginTop: -6, marginBottom: 10 }}>
+                    {t('dc_customerNameHint')}
+                  </Text>
+                </>
               ) : (
                 <TextInput
                   placeholder={saleType === 'WASTAGE' ? t('dc_reasonPlaceholder') : t('dc_notePlaceholder')}
@@ -13667,7 +17198,7 @@ function CustomerAppContent() {
               )}
 
               <Pressable
-                onPress={handleRecordSale}
+                onPress={() => handleRecordSale()}
                 disabled={recordSaleLoading || (!!inventoryVoiceTranscript && !inventoryVoiceConfirmed)}
                 style={[
                   styles.modalSubmitBtn,
@@ -16838,6 +20369,22 @@ const styles = StyleSheet.create({
   },
 
   // Trips Tab
+  payGridHead: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: colors.muted,
+    textTransform: 'uppercase',
+  },
+  payGridCell: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.navy,
+  },
+  payGridSub: {
+    fontSize: 10,
+    color: colors.muted,
+    marginTop: 1,
+  },
   tripCard: {
     backgroundColor: colors.panel,
     borderRadius: 14,

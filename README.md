@@ -77,6 +77,36 @@ python app.py
 
 Configure the PostgreSQL connection in `backend/.env` before starting the API.
 
+# Android Play Store release
+
+The Android application ID is `com.autoledger.app`. Create a Google Play Console app with this exact ID, enroll in Play App Signing, and create a private upload key. Keep the key file and its passwords outside the repository; `.keystore` and `.p12` files are ignored by Git.
+
+Generate an upload key with Java's `keytool` from a secure folder:
+
+```powershell
+keytool -genkeypair -v -storetype PKCS12 -keystore autoledger-upload-key.p12 -alias autoledger-upload -keyalg RSA -keysize 2048 -validity 10000
+```
+
+Add these entries to `%USERPROFILE%\.gradle\gradle.properties` (create the file if needed), using the actual path and values chosen when generating the key:
+
+```properties
+AUTOLEDGER_UPLOAD_STORE_FILE=D:/secure-keys/autoledger-upload-key.p12
+AUTOLEDGER_UPLOAD_STORE_PASSWORD=your-store-password
+AUTOLEDGER_UPLOAD_KEY_ALIAS=autoledger-upload
+AUTOLEDGER_UPLOAD_KEY_PASSWORD=your-key-password
+```
+
+Build the signed Android App Bundle from the repository root:
+
+```powershell
+cd android
+.\gradlew.bat bundleRelease
+```
+
+Upload `android/app/build/outputs/bundle/release/app-release.aab` in Play Console. Before each later release, increment `versionCode` in `android/app/build.gradle` (starting at `2` after the first upload).
+
+Before submitting, complete the store listing, content rating, Data safety form, and privacy policy. This app requests `READ_SMS` to detect bank payment alerts. Google Play restricts SMS permissions: declare the financial-transaction use in Play Console and submit it for review; approval is not guaranteed. If the permission is rejected, remove the SMS auto-record feature and permission before publishing.
+
 ## Step 3: Modify your app
 
 Now that you have successfully run the app, let's make changes!
