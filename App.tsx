@@ -1258,6 +1258,7 @@ function CustomerAppContent() {
   const shownDriverQr = merchantQrUrl || driverQr;
   const [merchantCanUpdateKeys, setMerchantCanUpdateKeys] = useState(false);
   const [merchantTestMode, setMerchantTestMode] = useState(false);
+  const [merchantSyncError, setMerchantSyncError] = useState<string | null>(null);
   // Speaks each new QR payment aloud ("50 rupees received"), like a soundbox
   const [paySoundOn, setPaySoundOn] = useState(true);
   const announcedQrTrips = useRef<Set<string> | null>(null);
@@ -9389,6 +9390,7 @@ function CustomerAppContent() {
                   ref={merchantPanelRef}
                   compactWhenActive
                   hidePaymentsGrid
+                  onSyncError={setMerchantSyncError}
                   onQrChange={(url, canUpdateKeys, testMode) => {
                     setMerchantQrUrl(url);
                     setMerchantCanUpdateKeys(canUpdateKeys);
@@ -9457,6 +9459,9 @@ function CustomerAppContent() {
                     </Pressable>
                   )}
                 </View>
+                {!!merchantSyncError && (
+                  <Text style={{ fontSize: 11, color: colors.red, marginTop: 6 }}>⚠️ {t('drv_paySyncError')}: {merchantSyncError}</Text>
+                )}
                 {trips.length + fuelLogs.length === 0 ? (
                   <Text style={{ fontSize: 11, color: colors.muted, marginTop: 8 }}>{t('drv_payGridEmpty')}</Text>
                 ) : (

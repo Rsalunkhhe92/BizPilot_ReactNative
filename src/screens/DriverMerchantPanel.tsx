@@ -67,6 +67,8 @@ interface Props {
   onQrChange?: (qrImageUrl: string | null, canUpdateKeys: boolean, testMode: boolean) => void;
   /** Once the account is active, drop the account card: the screen shows the QR and an edit icon itself. */
   compactWhenActive?: boolean;
+  /** Reports why the server could not read the driver's payments from the gateway (null when it could). */
+  onSyncError?: (message: string | null) => void;
   /** The screen lists QR payments itself (together with cash), so do not render the grid here. */
   hidePaymentsGrid?: boolean;
 }
@@ -98,7 +100,7 @@ const EMPTY_FORM = {
 type FormState = typeof EMPTY_FORM;
 
 export default forwardRef<DriverMerchantPanelHandle, Props>(function DriverMerchantPanel(
-  { ownerId, userName, userEmail, apiFetch, t, onPaymentsChanged, onQrChange, compactWhenActive, hidePaymentsGrid },
+  { ownerId, userName, userEmail, apiFetch, t, onPaymentsChanged, onQrChange, compactWhenActive, hidePaymentsGrid, onSyncError },
   ref,
 ) {
   const [loading, setLoading] = useState(true);
@@ -150,6 +152,7 @@ export default forwardRef<DriverMerchantPanelHandle, Props>(function DriverMerch
       setPayments(list);
       setTodayTotal(data.todayTotal || 0);
       setTodayCount(data.todayCount || 0);
+      onSyncError?.(data.syncError || null);
       // undefined = first load. Later, any change (including the list emptying) means trips changed too.
       const topId = list[0]?.id ?? null;
       const previous = lastTopPaymentId.current;
