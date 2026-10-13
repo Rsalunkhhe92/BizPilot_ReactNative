@@ -48,6 +48,7 @@ import { detectUpiCredit } from './smsPayments';
 import { isSmsReaderAvailable, readInbox } from './modules/sms-reader';
 import DriverMerchantPanel, { DriverMerchantPanelHandle } from './src/screens/DriverMerchantPanel';
 import { useDutyDistance } from './src/hooks/useDutyDistance';
+import RideAlertsModal from './src/screens/RideAlertsModal';
 import { Language, LANGUAGE_LABELS, TranslationKey, translate } from './i18n';
 
 const INVENTORY_CART_NOTE_PREFIX = '__AUTOLEDGER_CART__:';
@@ -1264,6 +1265,7 @@ function CustomerAppContent() {
   const paySoundOnRef = useRef(true);
   paySoundOnRef.current = paySoundOn;
   const [showDaySummary, setShowDaySummary] = useState(false);
+  const [showRideAlerts, setShowRideAlerts] = useState(false);
   const [showKeysTip, setShowKeysTip] = useState(false);
   const merchantPanelRef = React.useRef<DriverMerchantPanelHandle>(null);
   const [qrSaving, setQrSaving] = useState(false);
@@ -8191,20 +8193,6 @@ function CustomerAppContent() {
 
                 return (
                   <>
-                    {routeSafetyAdvisory && (
-                      <View style={{
-                        flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 14, padding: 12, marginBottom: 14,
-                        backgroundColor: routeSafetyAdvisory.severity === 'high' ? colors.redBg : colors.amberBg,
-                        borderWidth: 1, borderColor: routeSafetyAdvisory.severity === 'high' ? colors.redBorder : colors.amberBorder,
-                      }}>
-                        <Text style={{ fontSize: 20 }}>{routeSafetyAdvisory.severity === 'high' ? '⚠️' : '🌙'}</Text>
-                        <View style={{ flex: 1 }}>
-                          <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>{t('drv_safetyTitle')}</Text>
-                          <Text style={{ fontSize: 12, color: colors.slate, marginTop: 2 }}>{routeSafetyAdvisory.message}</Text>
-                        </View>
-                      </View>
-                    )}
-
                     <View style={styles.seatMapCard}>
                       <Text style={styles.sectionHeading}>{t('drv_navigateTitle')}</Text>
                       <Text style={{ fontSize: 12, color: colors.muted, marginTop: 2, marginBottom: 10 }}>{t('drv_navigateHint')}</Text>
@@ -8510,6 +8498,12 @@ function CustomerAppContent() {
                   <Pressable onPress={() => setShowDaySummary(true)} style={styles.homeQuickActionCard}>
                     <Text style={styles.homeQuickActionIcon}>📋</Text>
                     <Text style={styles.homeQuickActionLabel} numberOfLines={2}>{t('drv_sumTitle')}</Text>
+                  </Pressable>
+                )}
+                {Platform.OS === 'android' && !isTravelBusiness && hasFeature('trips') && (
+                  <Pressable onPress={() => setShowRideAlerts(true)} style={styles.homeQuickActionCard}>
+                    <Text style={styles.homeQuickActionIcon}>🚖</Text>
+                    <Text style={styles.homeQuickActionLabel} numberOfLines={2}>{t('ride_title')}</Text>
                   </Pressable>
                 )}
               </View>
@@ -16333,6 +16327,9 @@ function CustomerAppContent() {
             </View>
           </View>
         </Modal>
+
+        {/* Modal: raw notifications from ride-hailing apps (capture step, read-only) */}
+        <RideAlertsModal visible={showRideAlerts} onClose={() => setShowRideAlerts(false)} t={t} />
 
         {/* Modal: End-of-day summary (Auto Driver) */}
         <Modal visible={showDaySummary} animationType="fade" transparent onRequestClose={() => setShowDaySummary(false)}>
