@@ -1,17 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-  <!-- Only for the "send test alert" button, which posts a notification from this app. -->
-  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
-  <application>
-    <!-- Bound by the system once the driver grants "Notification access" in Settings. -->
-    <service
-      android:name="expo.modules.ridenotifications.RideNotificationService"
-      android:label="Ride app alerts"
-      android:exported="true"
-      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
-      <intent-filter>
-        <action android:name="android.service.notification.NotificationListenerService" />
-      </intent-filter>
-    </service>
-  </application>
-</manifest>
+<!-- Default manifest: no notification listener. Google Play Protect blocks sideloaded apps
+     that declare one, so the listener is only added for builds made with -PrideAlerts=true
+     (see src/rideAlerts/AndroidManifest.xml and build.gradle). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

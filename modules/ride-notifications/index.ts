@@ -11,6 +11,7 @@ export type RideNotification = {
 };
 
 type RideNotificationsNative = {
+  isListenerIncluded(): Promise<boolean>;
   isAccessGranted(): Promise<boolean>;
   openAccessSettings(): Promise<void>;
   readSince(sinceMs: number, maxCount: number): Promise<RideNotification[]>;
@@ -22,6 +23,16 @@ type RideNotificationsNative = {
 const native = requireOptionalNativeModule<RideNotificationsNative>('RideNotifications');
 
 export const isRideNotificationsAvailable = native !== null;
+
+/** Whether this build contains the notification listener at all (only test builds made with -PrideAlerts=true do). */
+export async function isRideListenerIncluded(): Promise<boolean> {
+  if (!native) return false;
+  try {
+    return await native.isListenerIncluded();
+  } catch {
+    return false;
+  }
+}
 
 /** Whether the driver has turned on "Notification access" for this app in Android Settings. */
 export async function isRideNotificationAccessGranted(): Promise<boolean> {

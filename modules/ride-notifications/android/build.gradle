@@ -12,4 +12,10 @@ android {
     versionCode 1
     versionName "0.1.0"
   }
+
+  // The notification listener is left out of normal builds: Play Protect refuses to install a
+  // sideloaded APK that declares one. Build with -PrideAlerts=true for a test APK that has it.
+  if (project.findProperty('rideAlerts') == 'true') {
+    sourceSets.main.manifest.srcFile 'src/rideAlerts/AndroidManifest.xml'
+  }
 }

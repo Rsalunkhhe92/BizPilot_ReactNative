@@ -3,8 +3,10 @@ package expo.modules.ridenotifications
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -23,6 +25,17 @@ class RideNotificationsModule : Module() {
 
   override fun definition() = ModuleDefinition {
     Name("RideNotifications")
+
+    // False in normal builds, where the listener service is left out of the manifest.
+    AsyncFunction("isListenerIncluded") {
+      val context = context()
+      try {
+        context.packageManager.getServiceInfo(ComponentName(context, RideNotificationService::class.java), 0)
+        true
+      } catch (e: PackageManager.NameNotFoundException) {
+        false
+      }
+    }
 
     AsyncFunction("isAccessGranted") {
       val context = context()

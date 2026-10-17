@@ -47,8 +47,10 @@ import * as Speech from 'expo-speech';
 import { detectUpiCredit } from './smsPayments';
 import { isSmsReaderAvailable, readInbox } from './modules/sms-reader';
 import DriverMerchantPanel, { DriverMerchantPanelHandle } from './src/screens/DriverMerchantPanel';
+import ProductSheetModal from './src/screens/ProductSheetModal';
 import { useDutyDistance } from './src/hooks/useDutyDistance';
 import RideAlertsModal from './src/screens/RideAlertsModal';
+import { isRideListenerIncluded } from './modules/ride-notifications';
 import { Language, LANGUAGE_LABELS, TranslationKey, translate } from './i18n';
 
 const INVENTORY_CART_NOTE_PREFIX = '__AUTOLEDGER_CART__:';
@@ -361,6 +363,9 @@ type CollectionRecord = {
   area?: string;
   status?: string;
 };
+
+// Units offered when adding a product. Stored as these English values; shown translated.
+const PRODUCT_UNITS = ['kg', 'gram', 'litre', 'piece', 'pair', 'plate', 'dozen', 'packet', 'box', 'bunch', 'strip', 'bottle'] as const;
 
 const CANDIDATE_API_URLS: string[] = (() => {
   const configured = (process.env.EXPO_PUBLIC_API_URL || '').trim().replace(/\/$/, '');
@@ -1052,6 +1057,10 @@ function CustomerAppContent() {
   const [newProductLowStock, setNewProductLowStock] = useState('');
   const [addProductLoading, setAddProductLoading] = useState(false);
 
+  const [showUnitPicker, setShowUnitPicker] = useState(false);
+  // Excel-style product sheet (Products tab): bulk add / update products by category.
+  const [showProductSheet, setShowProductSheet] = useState(false);
+
   const [showRecordSaleModal, setShowRecordSaleModal] = useState(false);
   const [saleProductId, setSaleProductId] = useState('');
   const [showProductPicker, setShowProductPicker] = useState(false);
@@ -1257,6 +1266,16 @@ function CustomerAppContent() {
   const [merchantQrUrl, setMerchantQrUrl] = useState<string | null>(null);
   const shownDriverQr = merchantQrUrl || driverQr;
   const [merchantCanUpdateKeys, setMerchantCanUpdateKeys] = useState(false);
+  // Loading the QR to show in the Products cart when the customer pays by UPI.
+  const [cartUpiQrLoading, setCartUpiQrLoading] = useState(false);
+  // Merchant account as seen from the cart: none yet, submitted but not live, or live with a QR.
+  const [cartMerchantState, setCartMerchantState] = useState<'none' | 'pending' | 'active'>('none');
+  const [showCartMerchantSetup, setShowCartMerchantSetup] = useState(false);
+  const cartMerchantSetupWasOpen = useRef(false);
+  useEffect(() => {
+    if (cartMerchantSetupWasOpen.current && !showCartMerchantSetup && cartPaymentMethod === 'UPI') loadCartUpiQr();
+    cartMerchantSetupWasOpen.current = showCartMerchantSetup;
+  }, [showCartMerchantSetup]);
   const [merchantTestMode, setMerchantTestMode] = useState(false);
   const [merchantSyncError, setMerchantSyncError] = useState<string | null>(null);
   // Speaks each new QR payment aloud ("50 rupees received"), like a soundbox
@@ -1267,6 +1286,11 @@ function CustomerAppContent() {
   paySoundOnRef.current = paySoundOn;
   const [showDaySummary, setShowDaySummary] = useState(false);
   const [showRideAlerts, setShowRideAlerts] = useState(false);
+  // Ride Alerts needs the notification listener, which only test builds contain.
+  const [rideAlertsIncluded, setRideAlertsIncluded] = useState(false);
+  useEffect(() => {
+    isRideListenerIncluded().then(setRideAlertsIncluded).catch(() => {});
+  }, []);
   const [showKeysTip, setShowKeysTip] = useState(false);
   const merchantPanelRef = React.useRef<DriverMerchantPanelHandle>(null);
   const [qrSaving, setQrSaving] = useState(false);
@@ -3686,6 +3710,10 @@ function CustomerAppContent() {
     }
   }
 
+  function unitLabel(unit: string) {
+    return (PRODUCT_UNITS as readonly string[]).includes(unit) ? t(`unit_${unit}` as TranslationKey) : unit;
+  }
+
   async function handleRecordSale(confirmedOverStock = false) {
     if (!saleProductId) {
       Alert.alert(t('common_missingField'), t('dc_missingProduct'));
@@ -5620,6 +5648,28 @@ function CustomerAppContent() {
       }
     })();
   }, [user?.id]);
+
+  // The cart's UPI QR is the merchant account's QR, generated automatically once the account is live.
+  async function loadCartUpiQr() {
+    if (!user?.id) return;
+    setCartUpiQrLoading(true);
+    try {
+      const res = await apiFetch(`/api/driver/merchant-account?owner_id=${user.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        const account = data.account;
+        // Matches DriverMerchantPanel: in own-keys mode a QR issued on the platform's keys is not shown.
+        const needsKeys = data.ownKeysMode === true && !!account && !account.ownKeys;
+        const isActive = account?.status === 'ACTIVATED' && account.hasQr && !needsKeys;
+        setMerchantQrUrl(isActive ? account.qrImageUrl ?? null : null);
+        setCartMerchantState(isActive ? 'active' : account ? 'pending' : 'none');
+      }
+    } catch (e) {
+      console.error('Error loading merchant QR for cart:', e);
+    } finally {
+      setCartUpiQrLoading(false);
+    }
+  }
 
   async function handlePickQr() {
     if (!user?.id) return;
@@ -8501,7 +8551,7 @@ function CustomerAppContent() {
                     <Text style={styles.homeQuickActionLabel} numberOfLines={2}>{t('drv_sumTitle')}</Text>
                   </Pressable>
                 )}
-                {Platform.OS === 'android' && !isTravelBusiness && hasFeature('trips') && (
+                {rideAlertsIncluded && !isTravelBusiness && hasFeature('trips') && (
                   <Pressable onPress={() => setShowRideAlerts(true)} style={styles.homeQuickActionCard}>
                     <Text style={styles.homeQuickActionIcon}>🚖</Text>
                     <Text style={styles.homeQuickActionLabel} numberOfLines={2}>{t('ride_title')}</Text>
@@ -10081,13 +10131,18 @@ function CustomerAppContent() {
                     )}
                   </Pressable>
                   <Pressable
-                    onPress={() => {
-                      setInventoryVoiceTranscript('');
-                      setInventoryVoiceConfirmed(false);
-                      setShowAddProductModal(true);
-                    }}
-                    style={styles.primaryPillBtn}>
-                    <Text style={styles.primaryPillBtnText}>{t('inv_addItem')}</Text>
+                    accessibilityRole="button"
+                    accessibilityLabel={t('sheet_openBtn')}
+                    onPress={() => setShowProductSheet(true)}
+                    style={{ width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 10, borderWidth: 1, borderColor: '#A9C9A0', backgroundColor: '#FFFFFF' }}>
+                    <Svg width={26} height={26} viewBox="0 0 26 26">
+                      <Rect x={7} y={2} width={17} height={22} rx={2} fill="#21A366" />
+                      <SvgLine x1={15.5} y1={2} x2={15.5} y2={24} stroke="#FFFFFF" strokeOpacity={0.5} strokeWidth={1} />
+                      <SvgLine x1={7} y1={9.5} x2={24} y2={9.5} stroke="#FFFFFF" strokeOpacity={0.5} strokeWidth={1} />
+                      <SvgLine x1={7} y1={16.5} x2={24} y2={16.5} stroke="#FFFFFF" strokeOpacity={0.5} strokeWidth={1} />
+                      <Rect x={2} y={6} width={13} height={14} rx={2} fill="#107C41" />
+                      <SvgText x={8.5} y={17} fontSize={11} fontWeight="bold" fill="#FFFFFF" textAnchor="middle">X</SvgText>
+                    </Svg>
                   </Pressable>
                 </View>
               </View>
@@ -10319,7 +10374,7 @@ function CustomerAppContent() {
                       <Text style={styles.emptyStateText}>{t('inv_cartEmpty')}</Text>
                     ) : (
                       <>
-                        <ScrollView style={{ maxHeight: 420 }}>
+                        <ScrollView style={{ maxHeight: cartPaymentMethod === 'UPI' ? 200 : 420 }}>
                           {inventoryCartItems.map(item => {
                             const quantity = Math.min(item.stockQty, Math.max(0, Number(cartQuantities[item.id]) || 0));
                             const lineAmount = quantity * item.sellingPrice;
@@ -10380,6 +10435,7 @@ function CustomerAppContent() {
                                   onPress={() => {
                                     setCartPaymentMethod(method);
                                     if (method === 'CREDIT' && customers.length === 0) loadCustomers();
+                                    if (method === 'UPI') loadCartUpiQr();
                                   }}
                                   style={{ paddingVertical: 6, paddingHorizontal: 9, borderRadius: 7, borderWidth: 1, borderColor: cartPaymentMethod === method ? colors.brand : colors.border, backgroundColor: cartPaymentMethod === method ? colors.brandBg : '#FFFFFF' }}>
                                   <Text style={{ fontSize: 10, fontWeight: '700', color: cartPaymentMethod === method ? colors.brand : colors.slate }}>
@@ -10431,6 +10487,51 @@ function CustomerAppContent() {
                               })()}
                             </View>
                           )}
+                          {cartPaymentMethod === 'UPI' && (
+                            <View style={{ alignItems: 'center', marginBottom: 10 }}>
+                              {cartUpiQrLoading && !merchantQrUrl ? (
+                                <ActivityIndicator size="small" color={colors.brand} style={{ marginVertical: 20 }} />
+                              ) : merchantQrUrl ? (
+                                <>
+                                  <View style={{ backgroundColor: '#FFFFFF', borderRadius: 12, borderWidth: 1, borderColor: colors.border, padding: 8 }}>
+                                    <Image
+                                      accessibilityLabel={t('drv_upiQrTitle')}
+                                      source={{ uri: merchantQrUrl }}
+                                      style={{ width: 170, aspectRatio: 0.7 }}
+                                      resizeMode="contain"
+                                    />
+                                  </View>
+                                  <Text style={{ fontSize: 11, color: colors.slate, textAlign: 'center', marginTop: 6 }}>
+                                    {t('inv_cartUpiScanHint', { amount: inventoryCartTotal.toLocaleString('en-IN', { maximumFractionDigits: 2 }) })}
+                                  </Text>
+                                </>
+                              ) : (
+                                // No live merchant QR: offer the setup, but recording the sale as UPI still works without it.
+                                <View style={{ alignSelf: 'stretch', borderWidth: 1, borderColor: '#C7D2FE', borderRadius: 12, backgroundColor: '#EEF2FF', padding: 12 }}>
+                                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                                    <Text style={{ fontSize: 22 }}>🏦</Text>
+                                    <View style={{ flex: 1 }}>
+                                      <Text style={{ fontSize: 13, fontWeight: '800', color: colors.navy }}>
+                                        {t(cartMerchantState === 'pending' ? 'inv_cartMchPendingTitle' : 'inv_cartMchTitle')}
+                                      </Text>
+                                      <Text style={{ fontSize: 11, color: colors.slate, marginTop: 2 }}>
+                                        {t(cartMerchantState === 'pending' ? 'inv_cartMchPendingHint' : 'inv_cartMchHint')}
+                                      </Text>
+                                    </View>
+                                  </View>
+                                  <Pressable
+                                    accessibilityRole="button"
+                                    onPress={() => setShowCartMerchantSetup(true)}
+                                    style={{ alignSelf: 'flex-start', marginTop: 10, paddingVertical: 7, paddingHorizontal: 12, borderRadius: 8, backgroundColor: colors.brand }}>
+                                    <Text style={{ fontSize: 12, fontWeight: '800', color: '#FFFFFF' }}>
+                                      {t(cartMerchantState === 'pending' ? 'inv_cartMchCheckBtn' : 'inv_cartMchSetupBtn')}
+                                    </Text>
+                                  </Pressable>
+                                  <Text style={{ fontSize: 11, color: colors.muted, marginTop: 8 }}>{t('inv_cartMchSkipHint')}</Text>
+                                </View>
+                              )}
+                            </View>
+                          )}
                           <Pressable
                             accessibilityRole="button"
                             accessibilityLabel={`${t(cartPaymentMethod === 'CREDIT' ? 'dc_recordSaleTitle' : 'inv_cartRecordPayment')} ₹${inventoryCartTotal}`}
@@ -10446,6 +10547,39 @@ function CustomerAppContent() {
                         </View>
                       </>
                     )}
+                  </View>
+                </View>
+              </Modal>
+
+              <Modal visible={showCartMerchantSetup} animationType="slide" transparent onRequestClose={() => setShowCartMerchantSetup(false)}>
+                <View style={styles.modalOverlay}>
+                  <View style={styles.modalContent}>
+                    <View style={styles.modalHeaderRow}>
+                      <Text style={styles.modalHeading}>🏦 {t('drv_mchTitle')}</Text>
+                      <Pressable onPress={() => setShowCartMerchantSetup(false)}>
+                        <Text style={styles.modalCloseText}>✕</Text>
+                      </Pressable>
+                    </View>
+                    <ScrollView keyboardShouldPersistTaps="handled">
+                      {user?.id && showCartMerchantSetup && (
+                        <DriverMerchantPanel
+                          ownerId={user.id}
+                          userName={user.fullName}
+                          userEmail={user.email}
+                          apiFetch={apiFetch}
+                          t={t}
+                          onPaymentsChanged={() => {}}
+                          hidePaymentsGrid
+                          onQrChange={url => {
+                            // The QR is live: back to the cart, which now shows it.
+                            if (!url) return;
+                            setMerchantQrUrl(url);
+                            setCartMerchantState('active');
+                            setShowCartMerchantSetup(false);
+                          }}
+                        />
+                      )}
+                    </ScrollView>
                   </View>
                 </View>
               </Modal>
@@ -16864,13 +16998,14 @@ function CustomerAppContent() {
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.fieldLabel}>{t('inv_unit')}</Text>
-                  <TextInput
-                    placeholder={t('inv_unitPlaceholder')}
-                    placeholderTextColor={colors.muted}
-                    style={styles.modalInput}
-                    value={newProductUnit}
-                    onChangeText={setNewProductUnit}
-                  />
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={t('inv_unitPickerTitle')}
+                    onPress={() => setShowUnitPicker(true)}
+                    style={[styles.modalInput, { flexDirection: 'row', alignItems: 'center' }]}>
+                    <Text style={{ flex: 1, fontSize: 15, color: colors.navy }} numberOfLines={1}>{unitLabel(newProductUnit || 'kg')}</Text>
+                    <Text style={{ fontSize: 11, color: colors.muted }}>▾</Text>
+                  </Pressable>
                 </View>
               </View>
 
@@ -16952,6 +17087,47 @@ function CustomerAppContent() {
             </View>
           </View>
         </Modal>
+
+        {/* Modal: Unit picker (Add/Edit Product) */}
+        <Modal visible={showUnitPicker} animationType="fade" transparent onRequestClose={() => setShowUnitPicker(false)}>
+          <Pressable style={{ flex: 1, backgroundColor: 'rgba(15, 23, 42, 0.5)', justifyContent: 'center', padding: 24 }} onPress={() => setShowUnitPicker(false)}>
+            <Pressable style={{ backgroundColor: colors.panel, borderRadius: 18, padding: 18 }} onPress={() => {}}>
+              <Text style={[styles.modalHeading, { marginBottom: 4 }]}>{t('inv_unitPickerTitle')}</Text>
+              <Text style={{ fontSize: 12, color: colors.muted, marginBottom: 12 }}>{t('inv_unitPickerHint')}</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+                {PRODUCT_UNITS.map(unit => {
+                  const selected = (newProductUnit || 'kg') === unit;
+                  return (
+                    <Pressable
+                      key={unit}
+                      accessibilityRole="radio"
+                      accessibilityState={{ selected }}
+                      onPress={() => { setNewProductUnit(unit); setShowUnitPicker(false); }}
+                      style={{ minWidth: '30%', flexGrow: 1, alignItems: 'center', paddingVertical: 10, borderRadius: 10, borderWidth: 1, borderColor: selected ? colors.brand : colors.border, backgroundColor: selected ? colors.brand : colors.page }}>
+                      <Text style={{ fontSize: 13, fontWeight: '800', color: selected ? '#FFFFFF' : colors.navy }}>{unitLabel(unit)}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
+        {user?.id && (
+          <ProductSheetModal
+            visible={showProductSheet}
+            onClose={() => setShowProductSheet(false)}
+            ownerId={user.id}
+            apiFetch={apiFetch}
+            t={t}
+            units={PRODUCT_UNITS}
+            unitLabel={unitLabel}
+            onSaved={() => {
+              loadInventoryProducts();
+              loadDailyRates();
+            }}
+          />
+        )}
 
         {/* Modal: Record Daily Sale/Transaction (Fruit Sellers / Retailers) */}
         <Modal visible={showRecordSaleModal} animationType="slide" transparent>

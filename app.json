@@ -14,9 +14,7 @@
     },
     "android": {
       "package": "com.autoledger.app",
-      "permissions": [
-        "READ_SMS"
-      ],
+      "permissions": [],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#3730A3"
