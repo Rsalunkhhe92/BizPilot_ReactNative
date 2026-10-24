@@ -11,6 +11,7 @@ import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } f
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Image,
   Modal,
   Pressable,
@@ -22,7 +23,8 @@ import {
 } from 'react-native';
 import { TranslationKey } from '../../i18n';
 
-const POLL_INTERVAL_MS = 10000;
+// A scan should show up within seconds; polling stops while the app is in the background.
+const POLL_INTERVAL_MS = 3000;
 
 interface MerchantAccount {
   legalName: string;
@@ -177,9 +179,23 @@ export default forwardRef<DriverMerchantPanelHandle, Props>(function DriverMerch
   // While the panel is on screen, keep pulling so a payment shows up seconds after the scan.
   useEffect(() => {
     if (!isActive) return;
-    loadPayments();
-    const timer = setInterval(loadPayments, POLL_INTERVAL_MS);
-    return () => clearInterval(timer);
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const start = () => {
+      if (timer) return;
+      loadPayments();
+      timer = setInterval(loadPayments, POLL_INTERVAL_MS);
+    };
+    const stop = () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    };
+    if (AppState.currentState === 'active') start();
+    // Back in the foreground: check at once, so a payment made meanwhile appears immediately.
+    const sub = AppState.addEventListener('change', state => (state === 'active' ? start() : stop()));
+    return () => {
+      stop();
+      sub.remove();
+    };
   }, [isActive, ownerId]);
 
   function openForm() {

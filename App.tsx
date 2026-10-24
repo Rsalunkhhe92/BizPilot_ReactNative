@@ -48,10 +48,14 @@ import { detectUpiCredit } from './smsPayments';
 import { isSmsReaderAvailable, readInbox } from './modules/sms-reader';
 import DriverMerchantPanel, { DriverMerchantPanelHandle } from './src/screens/DriverMerchantPanel';
 import ProductSheetModal from './src/screens/ProductSheetModal';
+import TransactionLogCard from './src/screens/TransactionLog';
+import VendorBillModal from './src/screens/VendorBillModal';
 import { useDutyDistance } from './src/hooks/useDutyDistance';
 import RideAlertsModal from './src/screens/RideAlertsModal';
 import { isRideListenerIncluded } from './modules/ride-notifications';
 import { Language, LANGUAGE_LABELS, TranslationKey, translate } from './i18n';
+import BachatGatModule, { BachatGatEntry, BachatGatHomeCard, isBachatGatUser } from './src/screens/bachatgat/BachatGatModule';
+import { shgTranslate } from './src/screens/bachatgat/i18n';
 
 const INVENTORY_CART_NOTE_PREFIX = '__AUTOLEDGER_CART__:';
 
@@ -302,6 +306,9 @@ type DriverTrip = {
   longitude: number | null;
   // Set when the trip was recorded automatically from a payment on the driver's merchant QR.
   qr?: { payerVpa: string; ref: string; transferStatus: string; refundedAmount: number } | null;
+  // UTR / reference of a UPI trip, and whether the driver attached a payment screenshot.
+  upiRef?: string;
+  hasReceipt?: boolean;
 };
 
 type FuelLog = {
@@ -369,9 +376,10 @@ const PRODUCT_UNITS = ['kg', 'gram', 'litre', 'piece', 'pair', 'plate', 'dozen',
 
 const CANDIDATE_API_URLS: string[] = (() => {
   const configured = (process.env.EXPO_PUBLIC_API_URL || '').trim().replace(/\/$/, '');
-  // Installed (release) build: only the real backend. The emulator / LAN addresses below do
-  // not exist on a customer's phone, and each one hung for many seconds before falling through.
-  if (!__DEV__ && configured && !configured.includes('localhost')) return [configured];
+  // A hosted backend in EXPO_PUBLIC_API_URL is used on its own, in debug and release builds alike:
+  // the emulator / LAN addresses below do not exist on a customer's phone, and each one hung for
+  // seconds before falling through. Set EXPO_PUBLIC_API_URL=http://localhost:5000 to work locally.
+  if (configured && !/\/\/(localhost|127\.|10\.|192\.168\.)/.test(configured)) return [configured];
   const urls: string[] = [];
 
   if (Platform.OS === 'android') {
@@ -423,7 +431,7 @@ async function apiFetch(path: string, options?: RequestInit): Promise<Response> 
     const timer = controller ? setTimeout(() => controller.abort(), LOCAL_PROBE_TIMEOUT_MS) : null;
     try {
       const res = await fetch(fullUrl, controller ? { ...requestOptions, signal: controller.signal } : requestOptions);
-      if (res.status === 401 && path.startsWith('/api/inventory')) onSessionExpired?.();
+      if (res.status === 401 && (path.startsWith('/api/inventory') || path.startsWith('/api/bachatgat'))) onSessionExpired?.();
       return res;
     } finally {
       if (timer) clearTimeout(timer);
@@ -910,6 +918,8 @@ function CustomerAppContent() {
 
   // Customer Dashboard State
   const [activeTab, setActiveTab] = useState<string>('home');
+  // Mahila Bachat Gat: route to open when entering the module from the Home card
+  const [shgEntry, setShgEntry] = useState<BachatGatEntry | null>(null);
   const [transactions, setTransactions] = useState<LedgerTransaction[]>(INITIAL_TRANSACTIONS);
   const [dues, setDues] = useState<CustomerDue[]>(INITIAL_DUES);
   const [availablePlans, setAvailablePlans] = useState<SubscriptionPlan[]>([]);
@@ -973,6 +983,8 @@ function CustomerAppContent() {
   const [dcCalendarMonth, setDcCalendarMonth] = useState(new Date());
   const [showPurchaseDetailModal, setShowPurchaseDetailModal] = useState(false);
   const [vendors, setVendors] = useState<any[]>([]);
+  // Daily Collection > Other: amount owed to a vendor that is not a product purchase
+  const [showVendorBill, setShowVendorBill] = useState(false);
   const [selectedVendorNames, setSelectedVendorNames] = useState<string[]>([]);
   const [vendorsLoading, setVendorsLoading] = useState(false);
   const [showVendorPicker, setShowVendorPicker] = useState(false);
@@ -1281,6 +1293,9 @@ function CustomerAppContent() {
   // Speaks each new QR payment aloud ("50 rupees received"), like a soundbox
   const [paySoundOn, setPaySoundOn] = useState(true);
   const announcedQrTrips = useRef<Set<string> | null>(null);
+  // QR payments that just arrived: their grid rows are highlighted for a few seconds.
+  const [freshQrTripIds, setFreshQrTripIds] = useState<Set<string>>(new Set());
+  const freshQrTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Read through a ref: the payment poller keeps calling an older loadDriverTrips closure.
   const paySoundOnRef = useRef(true);
   paySoundOnRef.current = paySoundOn;
@@ -1295,6 +1310,10 @@ function CustomerAppContent() {
   const merchantPanelRef = React.useRef<DriverMerchantPanelHandle>(null);
   const [qrSaving, setQrSaving] = useState(false);
   const [showQuickPaymentModal, setShowQuickPaymentModal] = useState(false);
+  // UPI quick entry: the payment's UTR and an optional screenshot as proof.
+  const [quickPaymentUtr, setQuickPaymentUtr] = useState('');
+  const [quickPaymentReceipt, setQuickPaymentReceipt] = useState<{ base64: string; mime: string; uri: string } | null>(null);
+  const [receiptView, setReceiptView] = useState<{ uri: string | null; loading: boolean } | null>(null);
   // Quick fuel expense: amount + how it was paid, nothing else
   const [showQuickFuelModal, setShowQuickFuelModal] = useState(false);
   const [quickFuelAmount, setQuickFuelAmount] = useState('');
@@ -3479,16 +3498,20 @@ function CustomerAppContent() {
   }
 
   function updateInventoryCartQuantity(item: InventoryItem, value: string) {
-    const quantity = Number(value);
-    const safeValue = value !== '' && Number.isFinite(quantity) ? String(Math.min(item.stockQty, Math.max(0, quantity))) : value;
+    const typed = value.replace(',', '.');
+    // Keep what is being typed ("1.", "0.5") as text; only a number over the stock is cut back.
+    if (!/^d*.?d{0,2}$/.test(typed)) return;
+    const quantity = Number(typed);
+    const safeValue = typed !== '' && Number.isFinite(quantity) && quantity > item.stockQty ? String(item.stockQty) : typed;
     setCartQuantities(previous => ({ ...previous, [item.id]: safeValue }));
   }
 
-  function adjustInventoryCartQuantity(item: InventoryItem, change: number) {
+  function adjustInventoryCartQuantity(item: InventoryItem, direction: number) {
+    const step = cartQuantityStep(item.unit);
     const current = Number(cartQuantities[item.id]) || 0;
-    const minimum = Math.min(1, item.stockQty);
-    const next = Math.min(item.stockQty, Math.max(minimum, current + change));
-    setCartQuantities(previous => ({ ...previous, [item.id]: String(next) }));
+    const minimum = Math.min(step, item.stockQty);
+    const next = Math.min(item.stockQty, Math.max(minimum, current + direction * step));
+    setCartQuantities(previous => ({ ...previous, [item.id]: String(Math.round(next * 100) / 100) }));
   }
 
   async function handleSaveInventoryCart() {
@@ -4745,8 +4768,10 @@ function CustomerAppContent() {
     return bt.includes('building') || bt.includes('society');
   })();
   const isTravelBusiness = (user?.businessType || '').toLowerCase().includes('travel');
+  const isBachatGat = isBachatGatUser(user?.businessType, user?.enabledFeatures);
   const visibleTabs = [
     { key: 'home', label: t('nav_home'), icon: '🏠', show: true },
+    { key: 'shg', label: shgTranslate(language, 'mod_title'), icon: '👩‍👩‍👧', show: isBachatGat },
     { key: 'ledger', label: t('nav_dailyLedger'), icon: '📒', show: false },
     { key: 'collection_records', label: t('nav_collections'), icon: '💵', show: isCollection || hasFeature('collection_records') || hasFeature('payment_collection') },
     { key: 'collection_dashboard', label: t('nav_dashboard'), icon: '📊', show: isCollection },
@@ -5735,9 +5760,13 @@ function CustomerAppContent() {
     const known = announcedQrTrips.current;
     announcedQrTrips.current = new Set(qrTrips.map(tr => tr.id));
     // First load of the session: these were already there, nothing to announce.
-    if (!known || !paySoundOnRef.current) return;
+    if (!known) return;
     const fresh = qrTrips.filter(tr => !known.has(tr.id));
     if (fresh.length === 0) return;
+    setFreshQrTripIds(new Set(fresh.map(tr => tr.id)));
+    if (freshQrTimer.current) clearTimeout(freshQrTimer.current);
+    freshQrTimer.current = setTimeout(() => setFreshQrTripIds(new Set()), 8000);
+    if (!paySoundOnRef.current) return;
     const total = fresh.reduce((sum, tr) => sum + tr.fare, 0);
     speakConfirmation(t('drv_paySpoken', { amount: total }), language);
   }
@@ -5776,6 +5805,8 @@ function CustomerAppContent() {
         latitude: tr.latitude ?? null,
         longitude: tr.longitude ?? null,
         qr: tr.payment || null,
+        upiRef: tr.upiRef || '',
+        hasReceipt: !!tr.hasReceipt,
       }));
       setTrips(loaded);
       announceNewQrPayments(loaded);
@@ -7371,6 +7402,8 @@ function CustomerAppContent() {
     setShowQrModal(false);
     setQuickPaymentMode(mode);
     setQuickPaymentAmount('');
+    setQuickPaymentUtr('');
+    setQuickPaymentReceipt(null);
     setVoiceTranscript('');
     setVoiceConfirmed(false);
     setShowQuickPaymentModal(true);
@@ -7574,10 +7607,16 @@ function CustomerAppContent() {
           locationName: location?.locationName || '',
           latitude: location?.latitude,
           longitude: location?.longitude,
+          ...(quickPaymentMode === 'UPI' && quickPaymentUtr.trim() ? { upiRef: quickPaymentUtr.trim() } : {}),
+          ...(quickPaymentMode === 'UPI' && quickPaymentReceipt
+            ? { receiptBase64: quickPaymentReceipt.base64, receiptMime: quickPaymentReceipt.mime }
+            : {}),
         }),
       });
       const data = await res.json();
-      if (res.ok) {
+      if (res.ok && data.duplicate) {
+        Alert.alert(t('common_error'), t('drv_upiRefDuplicate'));
+      } else if (res.ok) {
         setShowQuickPaymentModal(false);
         loadDriverTrips();
         loadDriverTripsHistory();
@@ -7589,6 +7628,36 @@ function CustomerAppContent() {
       Alert.alert(t('common_error'), t('common_networkError'));
     } finally {
       setQuickPaymentSaving(false);
+    }
+  }
+
+  async function handlePickPaymentScreenshot() {
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) {
+      Alert.alert(t('common_error'), t('drv_permissionDenied'));
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], base64: true, quality: 0.5 });
+    if (result.canceled || !result.assets?.[0]?.base64) return;
+    const asset = result.assets[0];
+    const mime = asset.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
+    if (asset.base64!.length > 2_800_000) {
+      Alert.alert(t('common_error'), t('drv_receiptTooLarge'));
+      return;
+    }
+    setQuickPaymentReceipt({ base64: asset.base64!, mime, uri: `data:${mime};base64,${asset.base64}` });
+  }
+
+  async function handleViewPaymentScreenshot(trip: DriverTrip) {
+    setReceiptView({ uri: null, loading: true });
+    try {
+      const res = await apiFetch(`/api/driver/trips/${trip.id}/receipt`);
+      const data = await res.json();
+      if (!res.ok || !data.image) throw new Error(data.error || 'failed');
+      setReceiptView({ uri: data.image, loading: false });
+    } catch {
+      setReceiptView(null);
+      Alert.alert(t('common_error'), t('drv_receiptLoadFailed'));
     }
   }
 
@@ -8080,6 +8149,15 @@ function CustomerAppContent() {
         </LinearGradient>
 
         {/* Tab Content */}
+        {activeTab === 'shg' && isBachatGat ? (
+          <BachatGatModule
+            apiFetch={apiFetch}
+            language={language}
+            ownerName={user.fullName}
+            enabledFeatures={user.enabledFeatures}
+            entry={shgEntry}
+          />
+        ) : (
         <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
           {showDailySummary && dailySummaryText && (
             <View style={styles.dailySummaryBanner}>
@@ -8095,7 +8173,9 @@ function CustomerAppContent() {
           )}
           {activeTab === 'home' && (
             <View>
-              {!isTravelBusiness && !hasFeature('trips') && (
+              {/* Greeting banner; product businesses (fruit/vegetable sellers, shops) don't show it:
+                  the header above already greets the user and shows the business type. */}
+              {!isTravelBusiness && !hasFeature('trips') && !(hasFeature('inventory') || hasFeature('products')) && (
                 <View style={styles.homeBannerCard}>
                   <Text style={styles.homeBannerIcon}>{getBusinessIcon(user.businessType)}</Text>
                   <View style={{ flex: 1 }}>
@@ -8107,6 +8187,18 @@ function CustomerAppContent() {
                     </Text>
                   </View>
                 </View>
+              )}
+
+              {isBachatGat && (
+                <BachatGatHomeCard
+                  apiFetch={apiFetch}
+                  language={language}
+                  enabledFeatures={user.enabledFeatures}
+                  onOpen={(route, params) => {
+                    setShgEntry({ route, params, nonce: Date.now() });
+                    setActiveTab('shg');
+                  }}
+                />
               )}
 
               {isTravelBusiness && (() => {
@@ -8441,6 +8533,9 @@ function CustomerAppContent() {
                         ))}
                       </View>
                     )}
+
+                    {/* Transaction log: latest 5 movements, "View all" for the full history */}
+                    <TransactionLogCard ownerId={user.id} apiFetch={apiFetch} t={t} refreshKey={inventoryTransactions} />
 
                     {trend.length > 0 && (
                       <Pressable style={[styles.chartCard, { marginBottom: 14 }]} onPress={() => setActiveTab('inventory_insights')}>
@@ -9572,6 +9667,8 @@ function CustomerAppContent() {
                         : t('drv_mchTrfPending');
                       const detail = qr
                         ? t('drv_mchRef', { ref: qr.ref })
+                        : trip.upiRef
+                        ? t(merchantQrUrl ? 'drv_utrUnconfirmed' : 'drv_utrOnly', { ref: trip.upiRef })
                         : trip.distanceKm > 0
                         ? `${trip.startKm} → ${trip.endKm} km`
                         : trip.route
@@ -9580,14 +9677,20 @@ function CustomerAppContent() {
                       return (
                         <Pressable
                           key={trip.id}
+                          onPress={trip.hasReceipt ? () => handleViewPaymentScreenshot(trip) : undefined}
                           onLongPress={() => handleDeleteTrip(trip)}
-                          style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border }}>
+                          accessibilityLiveRegion={freshQrTripIds.has(trip.id) ? 'polite' : 'none'}
+                          style={[
+                            { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
+                            freshQrTripIds.has(trip.id) && { backgroundColor: colors.greenBg, borderRadius: 8, borderBottomColor: colors.greenBorder },
+                          ]}>
                           <Text style={[styles.payGridCell, { width: 58 }]}>{trip.time}</Text>
                           <View style={{ flex: 1 }}>
                             <Text style={styles.payGridCell} numberOfLines={1}>
                               {qr?.payerVpa || trip.route || trip.locationName || (isCash ? t('drv_payCashEntry') : t('drv_mchUnknownPayer'))}
                             </Text>
-                            {!!detail && <Text style={styles.payGridSub} numberOfLines={1}>{detail}</Text>}
+                            {!!detail && <Text style={styles.payGridSub} numberOfLines={1}>{trip.hasReceipt ? '📎 ' : ''}{detail}</Text>}
+                            {!detail && trip.hasReceipt && <Text style={styles.payGridSub}>📎 {t('drv_receiptTitle')}</Text>}
                           </View>
                           <Text style={[styles.payGridCell, { width: 62, textAlign: 'right', color: colors.green, fontWeight: '800' }]}>₹{trip.fare.toLocaleString()}</Text>
                           <View style={{ width: 72, alignItems: 'flex-end' }}>
@@ -10406,8 +10509,8 @@ function CustomerAppContent() {
                                       onChangeText={value => updateInventoryCartQuantity(item, value)}
                                       onEndEditing={() => {
                                         const entered = Number(cartQuantities[item.id]);
-                                        const valid = Number.isFinite(entered) && entered > 0 ? entered : Math.min(1, item.stockQty);
-                                        setCartQuantities(previous => ({ ...previous, [item.id]: String(Math.min(item.stockQty, valid)) }));
+                                        const valid = Number.isFinite(entered) && entered > 0 ? entered : Math.min(cartQuantityStep(item.unit), item.stockQty);
+                                        setCartQuantities(previous => ({ ...previous, [item.id]: String(Math.round(Math.min(item.stockQty, valid) * 100) / 100) }));
                                       }}
                                       style={{ width: 58, height: 36, paddingHorizontal: 6, borderWidth: 1, borderColor: colors.border, borderRadius: 8, textAlign: 'center', color: colors.navy }} />
                                     <Pressable
@@ -10780,7 +10883,26 @@ function CustomerAppContent() {
                 <Pressable onPress={() => handleOpenRecordSale(undefined, 'WASTAGE')} style={[styles.primaryPillBtn, { flex: 1, alignItems: 'center', backgroundColor: colors.red }]}>
                   <Text style={styles.primaryPillBtnText}>🗑️ {t('dc_wastage')}</Text>
                 </Pressable>
+                <Pressable
+                  onPress={() => { if (!vendors.length) loadVendors(); setShowVendorBill(true); }}
+                  accessibilityRole="button"
+                  accessibilityLabel={t('vbill_button')}
+                  style={[styles.primaryPillBtn, { flex: 1, alignItems: 'center', backgroundColor: colors.slate }]}>
+                  <Text style={styles.primaryPillBtnText}>📝 {t('vbill_button')}</Text>
+                </Pressable>
               </View>
+              {user?.id && (
+                <VendorBillModal
+                  visible={showVendorBill}
+                  onClose={() => setShowVendorBill(false)}
+                  ownerId={user.id}
+                  vendorNames={vendors.map((v: any) => v.vendorName).filter(Boolean)}
+                  date={dcSelectedDate}
+                  apiFetch={apiFetch}
+                  t={t}
+                  onSaved={loadVendors}
+                />
+              )}
 
               <View style={styles.kpiRow}>
                 <View style={styles.kpiCard}>
@@ -13595,6 +13717,7 @@ function CustomerAppContent() {
             </View>
           )}
         </ScrollView>
+        )}
 
         {/* Modal: Settle Collection Payment */}
         <Modal visible={showCollectModal} animationType="slide" transparent>
@@ -15337,7 +15460,7 @@ function CustomerAppContent() {
                           }}>
                             <View style={{ flex: 1 }}>
                               <Text style={{ fontSize: 13, fontWeight: '700', color: colors.navy }} numberOfLines={1}>
-                                {p.productName} <Text style={{ fontWeight: '500', color: colors.muted }}>({p.quantity} {p.unit})</Text>
+                                {p.productName} {p.quantity > 0 ? <Text style={{ fontWeight: '500', color: colors.muted }}>({p.quantity} {p.unit})</Text> : <Text style={{ fontWeight: '500', color: colors.muted }}>({t('vbill_ledgerTag')})</Text>}
                               </Text>
                               <Text style={{ fontSize: 11, color: colors.muted, marginTop: 1 }}>{p.date}</Text>
                             </View>
@@ -16439,6 +16562,38 @@ function CustomerAppContent() {
                 value={quickPaymentAmount}
                 onChangeText={setQuickPaymentAmount}
               />
+              {quickPaymentMode === 'UPI' && (
+                <>
+                  <Text style={[styles.fieldLabel, { marginTop: 12 }]}>{t('drv_upiRefLabel')}</Text>
+                  <TextInput
+                    keyboardType="default"
+                    autoCapitalize="characters"
+                    placeholder={t('drv_upiRefPh')}
+                    placeholderTextColor={colors.muted}
+                    style={styles.modalInput}
+                    value={quickPaymentUtr}
+                    onChangeText={setQuickPaymentUtr}
+                    maxLength={40}
+                  />
+                  <Text style={{ fontSize: 11, color: colors.muted, marginTop: 4 }}>{t('drv_upiRefHint')}</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 12 }}>
+                    <Pressable
+                      onPress={handlePickPaymentScreenshot}
+                      accessibilityRole="button"
+                      style={{ flex: 1, borderWidth: 1, borderColor: colors.border, borderStyle: 'dashed', borderRadius: 10, paddingVertical: 10, alignItems: 'center' }}>
+                      <Text style={{ fontSize: 13, fontWeight: '700', color: colors.brand }}>
+                        📎 {quickPaymentReceipt ? t('drv_changeScreenshot') : t('drv_attachScreenshot')}
+                      </Text>
+                    </Pressable>
+                    {quickPaymentReceipt && (
+                      <Pressable onPress={() => setQuickPaymentReceipt(null)} accessibilityLabel={t('drv_removeScreenshot')}>
+                        <Image source={{ uri: quickPaymentReceipt.uri }} style={{ width: 44, height: 64, borderRadius: 6, backgroundColor: colors.page }} />
+                        <Text style={{ position: 'absolute', top: -6, right: -6, fontSize: 12 }}>✕</Text>
+                      </Pressable>
+                    )}
+                  </View>
+                </>
+              )}
               {!!voiceTranscript && (
                 <Pressable
                   onPress={() => setVoiceConfirmed(v => !v)}
@@ -16465,6 +16620,25 @@ function CustomerAppContent() {
               </Pressable>
             </View>
           </View>
+        </Modal>
+
+        {/* Modal: payment screenshot attached to a UPI entry */}
+        <Modal visible={!!receiptView} animationType="fade" transparent onRequestClose={() => setReceiptView(null)}>
+          <Pressable style={[styles.modalOverlay, { justifyContent: 'center' }]} onPress={() => setReceiptView(null)}>
+            <View style={[styles.modalContent, { alignItems: 'center' }]}>
+              <View style={[styles.modalHeaderRow, { alignSelf: 'stretch' }]}>
+                <Text style={styles.modalHeading}>📎 {t('drv_receiptTitle')}</Text>
+                <Pressable onPress={() => setReceiptView(null)}>
+                  <Text style={styles.modalCloseText}>✕</Text>
+                </Pressable>
+              </View>
+              {receiptView?.loading || !receiptView?.uri ? (
+                <ActivityIndicator color={colors.brand} style={{ marginVertical: 40 }} />
+              ) : (
+                <Image source={{ uri: receiptView.uri }} style={{ width: '100%', aspectRatio: 0.55, maxHeight: 520 }} resizeMode="contain" />
+              )}
+            </View>
+          </Pressable>
         </Modal>
 
         {/* Modal: raw notifications from ride-hailing apps (capture step, read-only) */}
@@ -19082,6 +19256,15 @@ function CustomerAppContent() {
   );
 }
 
+// +/- step in the sales cart: loose goods sell in halves (0.5 kg, 1.5 litre), grams in 50s,
+// countable goods (piece, packet, box...) in whole units. Any value can still be typed.
+function cartQuantityStep(unit?: string) {
+  const u = (unit || '').trim().toLowerCase();
+  if (u === 'gram' || u === 'g' || u === 'gm') return 50;
+  if (['kg', 'litre', 'liter', 'l', 'dozen', 'bunch'].includes(u)) return 0.5;
+  return 1;
+}
+
 function getBusinessIcon(type?: string) {
   if (!type) return '💼';
   const lower = type.toLowerCase();
@@ -19092,6 +19275,7 @@ function getBusinessIcon(type?: string) {
   if (lower.includes('mechanic')) return '🔧';
   if (lower.includes('retail') || lower.includes('store')) return '🏪';
   if (lower.includes('collection')) return '📊';
+  if (lower.includes('bachat') || lower.includes('self-help')) return '👩‍👩‍👧';
   return '💼';
 }
 
