@@ -3585,6 +3585,8 @@ function CustomerAppContent() {
         setShowInventoryCartModal(false);
         setCartCreditCustomerName('');
         setShowCartCustomerPicker(false);
+        // Take the user to today's Daily Collection, where this sale is listed (expanded) to check.
+        setActiveTab('daily_collection');
         Alert.alert(
           t('inv_cartSavedTitle'),
           t('inv_cartSavedMessage', {
