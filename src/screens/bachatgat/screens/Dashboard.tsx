@@ -9,6 +9,7 @@ import {
 } from '../ui';
 import { ShgKey } from '../i18n';
 import { useGatewaySync } from './Online';
+import { AutopilotBanner } from './Autopilot';
 
 export const TXN_LABEL: Record<string, ShgKey> = {
   SAVINGS_DEPOSIT: 'txn_SAVINGS_DEPOSIT', SAVINGS_WITHDRAWAL: 'txn_SAVINGS_WITHDRAWAL', SAVINGS_LOAN_OFFSET: 'txn_SAVINGS_LOAN_OFFSET',
@@ -96,6 +97,7 @@ export function DashboardScreen() {
         ]} />
       )}
       <View style={{ height: 8 }} />
+      <AutopilotBanner />
       <Gate loading={loading && !d} error={error} onRetry={reload}>
         {d && (
           <>
@@ -300,6 +302,7 @@ export function SimpleInput({ value, onChange, label, multiline }: { value: stri
 export function MoreScreen() {
   const { t, push, has } = useShg();
   const items: { icon: string; label: ShgKey; route: string; feature?: string }[] = [
+    { icon: '🤖', label: 'ap_title', route: 'autopilot', feature: 'shg_groups' },
     { icon: '📅', label: 'nav_meetings', route: 'meetings', feature: 'shg_meetings' },
     { icon: '📒', label: 'nav_accounts', route: 'accounts', feature: 'shg_accounts' },
     { icon: '🧵', label: 'nav_business', route: 'business', feature: 'shg_business' },

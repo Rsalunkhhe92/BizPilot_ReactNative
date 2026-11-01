@@ -50,12 +50,16 @@ import DriverMerchantPanel, { DriverMerchantPanelHandle } from './src/screens/Dr
 import ProductSheetModal from './src/screens/ProductSheetModal';
 import TransactionLogCard from './src/screens/TransactionLog';
 import VendorBillModal from './src/screens/VendorBillModal';
+import RecipeEditorModal from './src/screens/RecipeEditorModal';
+import UseStockModal from './src/screens/UseStockModal';
+import TradePanel from './src/screens/TradePanel';
 import { useDutyDistance } from './src/hooks/useDutyDistance';
 import RideAlertsModal from './src/screens/RideAlertsModal';
 import { isRideListenerIncluded } from './modules/ride-notifications';
 import { Language, LANGUAGE_LABELS, TranslationKey, translate } from './i18n';
 import BachatGatModule, { BachatGatEntry, BachatGatHomeCard, isBachatGatUser } from './src/screens/bachatgat/BachatGatModule';
 import { shgTranslate } from './src/screens/bachatgat/i18n';
+import FoodSellerModule, { foodTabs, isFoodSellerUser } from './src/screens/foodseller/FoodSellerModule';
 
 const INVENTORY_CART_NOTE_PREFIX = '__AUTOLEDGER_CART__:';
 
@@ -344,7 +348,24 @@ type InventoryItem = {
   sellingPrice: number;
   costPrice: number;
   lowStockThreshold: number;
+  productType?: ProductType;
+  // With a recipe, stockQty is what the ingredients can make and costPrice is what they cost.
+  hasRecipe?: boolean;
+  ingredientCount?: number;
+  usedToday?: number;
 };
+
+type ProductType = 'SELL' | 'PURCHASE';
+
+// Same rule as product_type_of() in the backend.
+function productTypeOf(item: InventoryItem): ProductType {
+  return item.productType || 'SELL';
+}
+
+// Out of stock blocks selling, but a purchase or recipe product must stay selectable to edit or restock.
+function canSelectInventoryItem(item: InventoryItem) {
+  return item.stockQty > 0 || productTypeOf(item) === 'PURCHASE' || !!item.hasRecipe;
+}
 
 type ServiceJob = {
   id: string;
@@ -431,7 +452,7 @@ async function apiFetch(path: string, options?: RequestInit): Promise<Response> 
     const timer = controller ? setTimeout(() => controller.abort(), LOCAL_PROBE_TIMEOUT_MS) : null;
     try {
       const res = await fetch(fullUrl, controller ? { ...requestOptions, signal: controller.signal } : requestOptions);
-      if (res.status === 401 && (path.startsWith('/api/inventory') || path.startsWith('/api/bachatgat'))) onSessionExpired?.();
+      if (res.status === 401 && (path.startsWith('/api/inventory') || path.startsWith('/api/bachatgat') || path.startsWith('/api/foodseller'))) onSessionExpired?.();
       return res;
     } finally {
       if (timer) clearTimeout(timer);
@@ -920,6 +941,7 @@ function CustomerAppContent() {
   const [activeTab, setActiveTab] = useState<string>('home');
   // Mahila Bachat Gat: route to open when entering the module from the Home card
   const [shgEntry, setShgEntry] = useState<BachatGatEntry | null>(null);
+  const [foodEntry, setFoodEntry] = useState<{ route: string; nonce: number } | null>(null);
   const [transactions, setTransactions] = useState<LedgerTransaction[]>(INITIAL_TRANSACTIONS);
   const [dues, setDues] = useState<CustomerDue[]>(INITIAL_DUES);
   const [availablePlans, setAvailablePlans] = useState<SubscriptionPlan[]>([]);
@@ -1067,6 +1089,11 @@ function CustomerAppContent() {
   // Set while the Add Product form is being used to edit an existing product.
   const [editingProductId, setEditingProductId] = useState<string | null>(null);
   const [newProductLowStock, setNewProductLowStock] = useState('');
+  const [newProductType, setNewProductType] = useState<ProductType>('SELL');
+  const [recipeProduct, setRecipeProduct] = useState<InventoryItem | null>(null);
+  const [useProduct, setUseProduct] = useState<InventoryItem | null>(null);
+  const [foldedGrids, setFoldedGrids] = useState<Record<ProductType, boolean>>({ SELL: true, PURCHASE: true });
+  const [productsView, setProductsView] = useState<'products' | 'purchases' | 'sales'>('products');
   const [addProductLoading, setAddProductLoading] = useState(false);
 
   const [showUnitPicker, setShowUnitPicker] = useState(false);
@@ -1570,6 +1597,7 @@ function CustomerAppContent() {
       '',
       `${t('ins_reportSales')}: ${money(sm.totalAmount)}`,
       `${t('ins_costOfGoods')}: ${money(sm.costOfGoodsSold)}`,
+      ...(sm.usageCost ? [`${t('use_costLabel')}: ${money(sm.usageCost)}`] : []),
       `${t('dc_wastageLabel')}: ${money(sm.wastageValue)}`,
       `${t('dc_expenses')}: ${money(sm.expenseValue)}`,
       `*${t('dc_netProfit')}: ${money(sm.netProfit)}*`,
@@ -2817,10 +2845,10 @@ function CustomerAppContent() {
       loadRestockSuggestions();
       loadDailyRates();
     }
-    if (user && (activeTab === 'vendors' || activeTab === 'daily_collection')) {
+    if (user && (activeTab === 'vendors' || activeTab === 'daily_collection' || activeTab === 'inventory')) {
       loadVendors();
     }
-    if (user && (activeTab === 'customers' || activeTab === 'daily_collection')) {
+    if (user && (activeTab === 'customers' || activeTab === 'daily_collection' || activeTab === 'inventory')) {
       loadCustomers();
     }
     if (user && activeTab === 'daily_collection') {
@@ -3474,7 +3502,7 @@ function CustomerAppContent() {
       });
       return;
     }
-    if (item.stockQty <= 0) return;
+    if (!canSelectInventoryItem(item)) return;
     setSelectedInventoryIds(previous => previous.includes(item.id) ? previous : [...previous, item.id]);
     setCartQuantities(previous => ({ ...previous, [item.id]: String(Math.min(1, item.stockQty)) }));
   }
@@ -3500,7 +3528,7 @@ function CustomerAppContent() {
   function updateInventoryCartQuantity(item: InventoryItem, value: string) {
     const typed = value.replace(',', '.');
     // Keep what is being typed ("1.", "0.5") as text; only a number over the stock is cut back.
-    if (!/^d*.?d{0,2}$/.test(typed)) return;
+    if (!/^\d*\.?\d{0,2}$/.test(typed)) return;
     const quantity = Number(typed);
     const safeValue = typed !== '' && Number.isFinite(quantity) && quantity > item.stockQty ? String(item.stockQty) : typed;
     setCartQuantities(previous => ({ ...previous, [item.id]: safeValue }));
@@ -3534,6 +3562,7 @@ function CustomerAppContent() {
     const cartId = lines.length > 1 ? `cart-${user.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` : null;
     const savedIds: string[] = [];
     let stoppedOnFailure = false;
+    let failureReason = '';
     try {
       for (const line of lines) {
         try {
@@ -3555,6 +3584,7 @@ function CustomerAppContent() {
             }),
           });
           if (!res.ok) {
+            failureReason = (await res.json().catch(() => null))?.error || '';
             stoppedOnFailure = true;
             break;
           }
@@ -3580,7 +3610,7 @@ function CustomerAppContent() {
       }
 
       if (stoppedOnFailure) {
-        Alert.alert(t('common_error'), t('inv_cartPartialSaved', { saved: savedIds.length, remaining: lines.length - savedIds.length }));
+        Alert.alert(t('common_error'), [t('inv_cartPartialSaved', { saved: savedIds.length, remaining: lines.length - savedIds.length }), failureReason].filter(Boolean).join('\n\n'));
       } else {
         setShowInventoryCartModal(false);
         setCartCreditCustomerName('');
@@ -3666,6 +3696,7 @@ function CustomerAppContent() {
     setNewProductSellingPrice('');
     setNewProductCostPrice('');
     setNewProductLowStock('');
+    setNewProductType('SELL');
   }
 
   function handleOpenEditProduct(item: InventoryItem) {
@@ -3679,6 +3710,7 @@ function CustomerAppContent() {
     setNewProductSellingPrice(String(item.sellingPrice));
     setNewProductCostPrice(String(item.costPrice));
     setNewProductLowStock(String(item.lowStockThreshold));
+    setNewProductType(productTypeOf(item));
     setShowAddProductModal(true);
   }
 
@@ -3692,7 +3724,7 @@ function CustomerAppContent() {
       return;
     }
     // A blank price would otherwise be saved over the existing one as ₹0.
-    if (editingProductId && !(parseFloat(newProductSellingPrice) > 0)) {
+    if (editingProductId && newProductType === 'SELL' && !(parseFloat(newProductSellingPrice) > 0)) {
       Alert.alert(t('common_missingField'), t('rate_invalid', { name: newProductName.trim() }));
       return;
     }
@@ -3707,9 +3739,11 @@ function CustomerAppContent() {
           category: newProductCategory.trim() || 'General',
           unit: newProductUnit.trim() || 'kg',
           stockQty: parseFloat(newProductStockQty) || 0,
-          sellingPrice: parseFloat(newProductSellingPrice) || 0,
+          // A purchase product has no selling price field, so an edit must not record a ₹0 rate.
+          ...(newProductType === 'SELL' ? { sellingPrice: parseFloat(newProductSellingPrice) || 0 } : {}),
           costPrice: parseFloat(newProductCostPrice) || 0,
           lowStockThreshold: parseFloat(newProductLowStock) || 0,
+          productType: newProductType,
         }),
       });
       const data = await res.json();
@@ -3768,7 +3802,8 @@ function CustomerAppContent() {
       Alert.alert(t('common_error'), t('inv_accountError'));
       return;
     }
-    const paidNow = saleType === 'PURCHASE' && salePaidNow.trim() !== '' ? parseFloat(salePaidNow) || 0 : undefined;
+    // A purchase without a vendor has no ledger to owe money in, so it is saved as paid in full.
+    const paidNow = saleType === 'PURCHASE' && salePaidNow.trim() !== '' && saleNote.trim() ? parseFloat(salePaidNow) || 0 : undefined;
 
     // Selling or wasting more than is in stock is usually a typo or stale stock -
     // check with the owner instead of silently zeroing the stock.
@@ -3801,6 +3836,7 @@ function CustomerAppContent() {
           paymentMethod: salePaymentMethod,
           note: saleNote.trim(),
           date: entryDate,
+          allowShortage: confirmedOverStock === true,
           ...(paidNow !== undefined ? { amountPaid: paidNow } : {}),
         }),
       });
@@ -4017,10 +4053,6 @@ function CustomerAppContent() {
       Alert.alert(t('common_missingField'), t('dc_missingPurchaseAmount'));
       return;
     }
-    if (purchaseLines.some(line => !line.vendor.trim())) {
-      Alert.alert(t('common_missingField'), t('dc_missingVendorName'));
-      return;
-    }
 
     setSelectedPurchaseSaving(true);
     const today = formatDateISO(new Date());
@@ -4040,7 +4072,8 @@ function CustomerAppContent() {
               amount: line.amount,
               type: 'PURCHASE',
               paymentMethod: 'CASH',
-              amountPaid: line.paid ? line.amount : 0,
+              // Vendor is optional; without one there is no ledger to owe money in, so it counts as paid.
+              amountPaid: line.paid || !line.vendor.trim() ? line.amount : 0,
               note: line.vendor.trim(),
               date: today,
               cartId,
@@ -4771,8 +4804,11 @@ function CustomerAppContent() {
   })();
   const isTravelBusiness = (user?.businessType || '').toLowerCase().includes('travel');
   const isBachatGat = isBachatGatUser(user?.businessType, user?.enabledFeatures);
+  const isFoodSeller = isFoodSellerUser(user?.businessType, user?.enabledFeatures);
+  const foodSellerTabs = isFoodSeller ? foodTabs(language, user?.enabledFeatures) : [];
   const visibleTabs = [
     { key: 'home', label: t('nav_home'), icon: '🏠', show: true },
+    ...foodSellerTabs.map((tab) => ({ ...tab, show: true })),
     { key: 'shg', label: shgTranslate(language, 'mod_title'), icon: '👩‍👩‍👧', show: isBachatGat },
     { key: 'ledger', label: t('nav_dailyLedger'), icon: '📒', show: false },
     { key: 'collection_records', label: t('nav_collections'), icon: '💵', show: isCollection || hasFeature('collection_records') || hasFeature('payment_collection') },
@@ -4789,7 +4825,8 @@ function CustomerAppContent() {
     { key: 'vendors', label: t('nav_vendors'), icon: '🏪', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'customers', label: t('nav_customers'), icon: '🧑‍🤝‍🧑', show: hasFeature('inventory') || hasFeature('products') },
     { key: 'inventory_insights', label: t('nav_insights'), icon: '📊', show: hasFeature('inventory') || hasFeature('products') },
-    { key: 'sales', label: t('nav_salesPos'), icon: '🛒', show: hasFeature('sales') },
+    // Hidden: this tab only ever showed sample figures. Real sales are in Products > Sales.
+    { key: 'sales', label: t('nav_salesPos'), icon: '🛒', show: false },
     { key: 'service_jobs', label: t('nav_jobCards'), icon: '🔧', show: hasFeature('service_jobs') },
     { key: 'building_setup', label: t('bld_navBuilding'), icon: '🏢', show: isBuildingBusiness },
     { key: 'building_floors', label: t('bld_navFloors'), icon: '🏗️', show: isBuildingBusiness },
@@ -8041,12 +8078,15 @@ function CustomerAppContent() {
   const totalFuelLitres = fuelLogs.reduce((acc, f) => acc + f.quantity, 0);
   const totalInventoryItems = inventory.reduce((acc, i) => acc + i.stockQty, 0);
   const lowStockCount = inventory.filter(i => i.stockQty <= i.lowStockThreshold).length;
-  const cartableInventory = inventory.filter(item => item.stockQty > 0);
+  // Only selling products reach the sale cart; a ticked purchase product is for edit, delete or record purchase.
+  const cartableInventory = inventory.filter(item => item.stockQty > 0 && productTypeOf(item) === 'SELL');
+  const selectedInventoryRows = inventory.filter(item => selectedInventoryIds.includes(item.id));
   const searchTerm = inventorySearchQuery.trim().toLocaleLowerCase();
   const filteredInventory = inventory.filter(item =>
     !searchTerm || `${item.name} ${item.category}`.toLocaleLowerCase().includes(searchTerm),
   );
-  const visibleCartableInventory = filteredInventory.filter(item => item.stockQty > 0);
+  // Select all must not tick products the owner cannot see in a folded list.
+  const visibleCartableInventory = filteredInventory.filter(item => item.stockQty > 0 && (!foldedGrids[productTypeOf(item)] || !!searchTerm));
   const inventoryCartItems = cartableInventory.filter(item => selectedInventoryIds.includes(item.id));
   const selectedInventoryCount = inventoryCartItems.length;
   const allInventorySelected = visibleCartableInventory.length > 0 && visibleCartableInventory.every(item => selectedInventoryIds.includes(item.id));
@@ -8112,7 +8152,14 @@ function CustomerAppContent() {
                 </Text>
               </View>
               <Pressable
-                onPress={() => Alert.alert(t('header_notifications'), t('header_noNotifications'))}
+                onPress={() => {
+                  if (isFoodSeller) {
+                    setFoodEntry({ route: 'notifications', nonce: Date.now() });
+                    setActiveTab('home');
+                  } else {
+                    Alert.alert(t('header_notifications'), t('header_noNotifications'));
+                  }
+                }}
                 hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}
                 style={styles.headerIconBtn}>
                 <Text style={{ fontSize: 17 }}>🔔</Text>
@@ -8158,6 +8205,16 @@ function CustomerAppContent() {
             ownerName={user.fullName}
             enabledFeatures={user.enabledFeatures}
             entry={shgEntry}
+          />
+        ) : isFoodSeller && (activeTab === 'home' || activeTab.startsWith('food_')) ? (
+          <FoodSellerModule
+            apiFetch={apiFetch}
+            language={language}
+            ownerName={user.fullName}
+            enabledFeatures={user.enabledFeatures}
+            section={activeTab as any}
+            onSection={setActiveTab}
+            entry={foodEntry}
           />
         ) : (
         <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
@@ -10220,6 +10277,38 @@ function CustomerAppContent() {
           {/* Business Feature Tab: Inventory / Products (Fruit/Vegetable & Retailer) */}
           {activeTab === 'inventory' && (hasFeature('inventory') || hasFeature('products')) && (
             <View>
+              <View style={{ flexDirection: 'row', gap: 6, marginBottom: 12, padding: 4, borderRadius: 12, backgroundColor: colors.brandBg }} accessibilityRole="tablist">
+                {([['products', '📦', t('seg_products')], ['purchases', '📥', t('ptab_title')], ['sales', '💰', t('stab_title')]] as const).map(([view, icon, label]) => {
+                  const selected = productsView === view;
+                  return (
+                    <Pressable
+                      key={view}
+                      accessibilityRole="tab"
+                      accessibilityState={{ selected }}
+                      onPress={() => setProductsView(view)}
+                      style={{ flex: 1, minHeight: 44, alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: selected ? '#FFFFFF' : 'transparent' }}>
+                      <Text style={{ fontSize: 13, fontWeight: '800', color: selected ? colors.brand : colors.slate }} numberOfLines={1}>{icon} {label}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
+              {productsView !== 'products' && (
+                <TradePanel
+                  key={productsView}
+                  mode={productsView === 'sales' ? 'SALE' : 'PURCHASE'}
+                  ownerId={Number(user.id)}
+                  products={inventory}
+                  partyNames={productsView === 'sales' ? customers.map((customer: any) => customer.customerName) : vendors.map((vendor: any) => vendor.vendorName)}
+                  apiFetch={apiFetch}
+                  t={t}
+                  today={formatDateISO(new Date())}
+                  onChanged={() => { loadInventoryProducts(); loadInventoryTransactions(dcSelectedDate); loadVendors(); loadCustomers(); loadRestockSuggestions(); }}
+                />
+              )}
+
+              {/* Stays mounted while another view shows, so ticks and search survive switching. */}
+              <View style={{ display: productsView === 'products' ? 'flex' : 'none' }}>
               <View style={styles.sectionHeaderRow}>
                 <Text style={[styles.sectionHeading, { flex: 1 }]} numberOfLines={1}>{t('inv_catalogHeading')}</Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
@@ -10378,14 +10467,14 @@ function CustomerAppContent() {
                       <Text style={{ fontSize: 10, fontWeight: '700', color: colors.slate }}>{t('inv_selectAllProducts')}</Text>
                     </Pressable>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                      <Text style={{ fontSize: 10, color: colors.muted }}>{t('inv_selectedCount', { count: selectedInventoryCount })}</Text>
-                      {selectedInventoryCount > 0 && (
+                      <Text style={{ fontSize: 10, color: colors.muted }}>{t('inv_selectedCount', { count: selectedInventoryRows.length })}</Text>
+                      {selectedInventoryRows.length > 0 && (
                         <>
-                          {selectedInventoryCount === 1 && (
+                          {selectedInventoryRows.length === 1 && (
                             <Pressable
                               accessibilityRole="button"
                               accessibilityLabel={t('inv_editProductTitle')}
-                              onPress={() => handleOpenEditProduct(inventoryCartItems[0])}
+                              onPress={() => handleOpenEditProduct(selectedInventoryRows[0])}
                               style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#C7D2FE', borderRadius: 6, backgroundColor: colors.brandBg }}>
                               <Text style={{ fontSize: 12 }}>✏️</Text>
                             </Pressable>
@@ -10410,19 +10499,41 @@ function CustomerAppContent() {
                       )}
                     </View>
                   </View>
-                  {filteredInventory.map((item, index) => {
+                  {(['SELL', 'PURCHASE'] as const).map(kind => {
+                    const rows = filteredInventory.filter(item => productTypeOf(item) === kind);
+                    if (!rows.length) return null;
+                    const isSellGrid = kind === 'SELL';
+                    // A search always shows its matches, even in a folded list.
+                    const isGridOpen = !foldedGrids[kind] || !!searchTerm;
+                    return (
+                  <View key={kind}>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={t(isSellGrid ? 'inv_sellProducts' : 'inv_purchaseProducts')}
+                    accessibilityState={{ expanded: isGridOpen }}
+                    onPress={() => setFoldedGrids(previous => ({ ...previous, [kind]: !previous[kind] }))}
+                    style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 10, minHeight: 44, backgroundColor: isSellGrid ? colors.greenBg : colors.amberBg, borderBottomWidth: 1, borderBottomColor: isSellGrid ? colors.greenBorder : colors.amberBorder }}>
+                    <Text style={{ fontSize: 12, fontWeight: '800', color: isSellGrid ? colors.greenDark : colors.amber }}>
+                      {isSellGrid ? '🛍️' : '🛒'} {t(isSellGrid ? 'inv_sellProducts' : 'inv_purchaseProducts')}
+                    </Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                      <Text style={{ fontSize: 11, fontWeight: '800', color: isSellGrid ? colors.greenDark : colors.amber }}>{rows.length}</Text>
+                      <Text style={{ fontSize: 13, fontWeight: '800', color: isSellGrid ? colors.greenDark : colors.amber }}>{isGridOpen ? '▲' : '▼'}</Text>
+                    </View>
+                  </Pressable>
+                  {isGridOpen && rows.map((item, index) => {
                     const isLow = item.stockQty <= item.lowStockThreshold;
                     const isSelected = selectedInventoryIds.includes(item.id);
                     return (
-                      <View key={item.id} style={{ paddingHorizontal: 9, paddingVertical: 8, borderBottomWidth: index < inventory.length - 1 ? 1 : 0, borderBottomColor: colors.border, backgroundColor: isSelected ? colors.brandBg : '#FFFFFF' }}>
+                      <View key={item.id} style={{ paddingHorizontal: 9, paddingVertical: 8, borderBottomWidth: index < rows.length - 1 || isSellGrid ? 1 : 0, borderBottomColor: colors.border, backgroundColor: isSelected ? colors.brandBg : '#FFFFFF' }}>
                         <View style={{ flexDirection: 'row', alignItems: 'flex-start' }}>
                           <Pressable
                             accessibilityRole="checkbox"
                             accessibilityState={{ checked: isSelected }}
                             accessibilityLabel={item.name}
                             onPress={() => toggleInventoryCartItem(item)}
-                            disabled={item.stockQty <= 0}
-                            style={{ width: 30, height: 30, alignItems: 'flex-start', justifyContent: 'center', opacity: item.stockQty <= 0 ? 0.45 : 1 }}>
+                            disabled={!canSelectInventoryItem(item)}
+                            style={{ width: 30, height: 30, alignItems: 'flex-start', justifyContent: 'center', opacity: canSelectInventoryItem(item) ? 1 : 0.45 }}>
                             <View style={{ width: 20, height: 20, alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1.5, borderColor: isSelected ? colors.brand : '#94A3B8', backgroundColor: isSelected ? colors.brand : '#FFFFFF' }}>
                               {isSelected && <Text style={{ color: '#FFFFFF', fontSize: 14, lineHeight: 16, fontWeight: '800' }}>✓</Text>}
                             </View>
@@ -10434,7 +10545,28 @@ function CustomerAppContent() {
                                 <Text style={{ flexShrink: 1, fontSize: 9, color: colors.muted }} numberOfLines={1}>{item.category || '—'}</Text>
                               </View>
                               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginLeft: 5 }}>
-                                {isLow && (
+                                {isSellGrid && (
+                                  <Pressable
+                                    accessibilityRole="button"
+                                    accessibilityLabel={`${t('rcp_title')} ${item.name}`}
+                                    onPress={() => setRecipeProduct(item)}
+                                    hitSlop={6}
+                                    style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 3, backgroundColor: item.hasRecipe ? colors.greenBg : colors.brandBg, borderColor: item.hasRecipe ? colors.greenBorder : '#C7D2FE', borderWidth: 1, paddingHorizontal: 6, height: 26, borderRadius: 6 }}>
+                                    <Text style={{ fontSize: 11 }}>🧾</Text>
+                                    <Text style={{ fontSize: 10, fontWeight: '800', color: item.hasRecipe ? colors.greenDark : colors.brand }}>{t('rcp_title')}</Text>
+                                  </Pressable>
+                                )}
+                                {!isSellGrid && (
+                                  <Pressable
+                                    accessibilityRole="button"
+                                    accessibilityLabel={`${t('use_button')} ${item.name}`}
+                                    onPress={() => setUseProduct(item)}
+                                    hitSlop={6}
+                                    style={{ alignItems: 'center', justifyContent: 'center', backgroundColor: colors.amberBg, borderColor: colors.amberBorder, borderWidth: 1, paddingHorizontal: 8, height: 26, borderRadius: 6 }}>
+                                    <Text style={{ fontSize: 10, fontWeight: '800', color: colors.amber }}>➖ {t('use_button')}</Text>
+                                  </Pressable>
+                                )}
+                                {isLow && !item.hasRecipe && (
                                   <Pressable
                                     accessibilityLabel={`Restock ${item.name}`}
                                     onPress={() => handleOpenEditStock(item)}
@@ -10451,20 +10583,56 @@ function CustomerAppContent() {
                               </View>
                             </View>
                             <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', columnGap: 8, marginTop: 3 }}>
-                              <Text style={{ fontSize: 10, fontWeight: '700', color: colors.navy }}>{item.stockQty} {item.unit}</Text>
+                              <Text style={{ fontSize: 10, fontWeight: '700', color: colors.navy }}>
+                                {item.hasRecipe ? `${t('rcp_canMake', { count: item.stockQty })} · ${t('rcp_ingredients', { count: item.ingredientCount || 0 })}` : `${item.stockQty} ${item.unit}`}
+                              </Text>
                               <Text style={{ fontSize: 9, fontWeight: '700', color: item.stockQty <= 0 ? colors.red : isLow ? colors.amber : colors.green }}>
                                 {item.stockQty <= 0 ? t('inv_outOfStock') : isLow ? t('inv_lowStock') : t('inv_inStock')}
                               </Text>
-                              <Text style={{ fontSize: 10, fontWeight: '800', color: colors.navy }}>₹{item.sellingPrice}/{item.unit}</Text>
-                              <Text style={{ fontSize: 9, color: colors.muted }}>₹{item.costPrice} {t('inv_costPrice')}</Text>
+                              {isSellGrid ? (
+                                <>
+                                  <Text style={{ fontSize: 10, fontWeight: '800', color: colors.navy }}>₹{item.sellingPrice}/{item.unit}</Text>
+                                  <Text style={{ fontSize: 9, color: colors.muted }}>₹{item.costPrice} {t('inv_costPrice')}</Text>
+                                </>
+                              ) : (
+                                <Text style={{ fontSize: 10, fontWeight: '800', color: colors.navy }}>{t('inv_purchaseRate')}: ₹{item.costPrice}/{item.unit}</Text>
+                              )}
+                              {!!item.usedToday && !item.hasRecipe && (
+                                <Text style={{ fontSize: 9, fontWeight: '700', color: colors.amber }}>{t('use_usedToday', { qty: item.usedToday, unit: item.unit })}</Text>
+                              )}
                             </View>
                           </View>
                         </View>
                       </View>
                     );
                   })}
+                  </View>
+                    );
+                  })}
                 </View>
               )}
+
+              <UseStockModal
+                visible={!!useProduct}
+                onClose={() => setUseProduct(null)}
+                ownerId={Number(user.id)}
+                product={useProduct}
+                today={formatDateISO(new Date())}
+                apiFetch={apiFetch}
+                t={t}
+                onSaved={() => { loadInventoryProducts(); loadRestockSuggestions(); }}
+              />
+
+              <RecipeEditorModal
+                visible={!!recipeProduct}
+                onClose={() => setRecipeProduct(null)}
+                ownerId={Number(user.id)}
+                product={recipeProduct}
+                products={inventory}
+                apiFetch={apiFetch}
+                t={t}
+                onSaved={() => { loadInventoryProducts(); loadRestockSuggestions(); }}
+              />
 
               <Modal visible={showInventoryCartModal} animationType="slide" transparent onRequestClose={() => setShowInventoryCartModal(false)}>
                 <View style={styles.modalOverlay}>
@@ -10853,6 +11021,7 @@ function CustomerAppContent() {
                   })}
                 </View>
               )}
+              </View>
             </View>
           )}
 
@@ -11144,6 +11313,7 @@ function CustomerAppContent() {
                     <View style={{ marginTop: 6 }}>
                       {line(t('ins_reportSales'), sm?.totalAmount, '+', colors.greenDark)}
                       {line(t('ins_costOfGoods'), sm?.costOfGoodsSold, '−', '#B45309')}
+                      {!!sm?.usageCost && line(t('use_costLabel'), sm.usageCost, '−', '#B45309')}
                       {line(t('dc_wastageLabel'), sm?.wastageValue, '−', colors.red)}
                       {line(t('dc_expenses'), sm?.expenseValue, '−', '#B45309')}
                       <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 10 }}>
@@ -17152,6 +17322,25 @@ function CustomerAppContent() {
                 </View>
               )}
 
+              <Text style={styles.fieldLabel}>{t('inv_productType')}</Text>
+              <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
+                {(['SELL', 'PURCHASE'] as const).map(kind => {
+                  const selected = newProductType === kind;
+                  return (
+                    <Pressable
+                      key={kind}
+                      accessibilityRole="radio"
+                      accessibilityState={{ selected }}
+                      onPress={() => setNewProductType(kind)}
+                      style={{ flex: 1, minHeight: 44, alignItems: 'center', justifyContent: 'center', borderRadius: 10, borderWidth: 1.5, borderColor: selected ? colors.brand : colors.border, backgroundColor: selected ? colors.brandBg : '#FFFFFF' }}>
+                      <Text style={{ fontSize: 13, fontWeight: '700', color: selected ? colors.brand : colors.slate }}>
+                        {kind === 'SELL' ? '🛍️' : '🛒'} {t(kind === 'SELL' ? 'inv_typeSell' : 'inv_typePurchase')}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+
               <Text style={styles.fieldLabel}>{t('inv_productName')}</Text>
               <TextInput
                 placeholder={t('inv_productNamePlaceholder')}
@@ -17211,6 +17400,7 @@ function CustomerAppContent() {
               </View>
 
               <View style={{ flexDirection: 'row', gap: 10 }}>
+                {newProductType === 'SELL' && (
                 <View style={{ flex: 1 }}>
                   <Text style={styles.fieldLabel}>{t('inv_sellingPriceLabel')}</Text>
                   <TextInput
@@ -17222,8 +17412,9 @@ function CustomerAppContent() {
                     onChangeText={setNewProductSellingPrice}
                   />
                 </View>
+                )}
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.fieldLabel}>{t('inv_costPrice')}</Text>
+                  <Text style={styles.fieldLabel}>{t(newProductType === 'SELL' ? 'inv_costPrice' : 'inv_purchaseRate')}</Text>
                   <TextInput
                     keyboardType="numeric"
                     placeholder="e.g. 90"
@@ -17350,7 +17541,7 @@ function CustomerAppContent() {
               </Pressable>
               {showProductPicker && (
                 <View style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, marginTop: -6, marginBottom: 10, overflow: 'hidden' }}>
-                  {inventory.map(p => (
+                  {inventory.filter(p => saleType === 'PURCHASE' || productTypeOf(p) === 'SELL').map(p => (
                     <Pressable
                       key={p.id}
                       onPress={() => {
@@ -17612,11 +17803,13 @@ function CustomerAppContent() {
         </Modal>
 
         {/* Floating AI Assistant Button */}
+        {!(isFoodSeller && (activeTab === 'food_ai' || !foodSellerTabs.some((tab) => tab.key === 'food_ai'))) && (
         <Pressable
-          onPress={handleOpenChat}
+          onPress={() => (isFoodSeller ? setActiveTab('food_ai') : handleOpenChat())}
           style={[styles.chatFab, { bottom: Math.max(insets.bottom + 20, 24) }]}>
           <Text style={styles.chatFabIcon}>💬</Text>
         </Pressable>
+        )}
 
         {/* Modal: AI Assistant Chatbot */}
         <Modal visible={showChatModal} animationType="slide" transparent onRequestClose={() => setShowChatModal(false)}>
@@ -19278,6 +19471,7 @@ function getBusinessIcon(type?: string) {
   if (lower.includes('retail') || lower.includes('store')) return '🏪';
   if (lower.includes('collection')) return '📊';
   if (lower.includes('bachat') || lower.includes('self-help')) return '👩‍👩‍👧';
+  if (lower.includes('food seller')) return '🍔';
   return '💼';
 }
 

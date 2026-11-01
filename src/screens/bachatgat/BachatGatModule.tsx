@@ -30,6 +30,7 @@ import { SchemeDetailScreen, SchemeFormScreen, SchemesScreen } from './screens/S
 import { ReportViewScreen, ReportsScreen } from './screens/Reports';
 import { PolicyScreen, SettingsScreen } from './screens/Settings';
 import { GatewayPaymentsScreen } from './screens/Online';
+import { AutopilotScreen } from './screens/Autopilot';
 
 const GROUP_KEY = 'shg:currentGroupId';
 
@@ -82,6 +83,7 @@ const SCREENS: Record<string, (p: { params: any }) => React.ReactElement> = {
   settings: () => <SettingsScreen />,
   policy: ({ params }) => <PolicyScreen params={params} />,
   gatewayPayments: ({ params }) => <GatewayPaymentsScreen params={params} />,
+  autopilot: () => <AutopilotScreen />,
 };
 
 // Which feature a route needs (routes not listed are always available).

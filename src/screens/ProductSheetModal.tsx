@@ -3,7 +3,7 @@
  * Excel-style product sheet for product shops (fruit, vegetable, kirana, shoes, mobile, medical...).
  *
  * One sheet (tab) per kind of shop, pre-filled with common products by the backend and merged with
- * the owner's own catalog. The owner fills stock and prices and saves only the rows that changed.
+ * the owner's own catalog. The owner fills type, stock and prices and saves only the rows that changed.
  * The same sheets can be downloaded as an .xlsx file, filled in Excel, and uploaded back for review.
  */
 
@@ -28,7 +28,9 @@ const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.s
 // The bulk save accepts at most this many products per request.
 const SAVE_CHUNK = 200;
 
-type Values = { unit: string; stockQty: string; sellingPrice: string; costPrice: string };
+type ProductType = 'SELL' | 'PURCHASE';
+
+type Values = { productType: ProductType; unit: string; stockQty: string; sellingPrice: string; costPrice: string };
 
 type Row = Values & {
   key: string;
@@ -46,6 +48,7 @@ type ApiRow = {
   stockQty: number | null;
   sellingPrice: number | null;
   costPrice: number | null;
+  productType?: ProductType | null;
   existing?: boolean;
 };
 
@@ -68,6 +71,7 @@ const numberText = (value: number | null | undefined) => (typeof value === 'numb
 
 function toRow(api: ApiRow): Row {
   const values: Values = {
+    productType: api.productType || 'SELL',
     unit: api.unit || '',
     stockQty: numberText(api.stockQty),
     sellingPrice: numberText(api.sellingPrice),
@@ -77,16 +81,16 @@ function toRow(api: ApiRow): Row {
 }
 
 function blankRow(): Row {
-  return { key: nextKey(), name: '', unit: '', stockQty: '', sellingPrice: '', costPrice: '', existing: false };
+  return { key: nextKey(), name: '', productType: 'SELL', unit: '', stockQty: '', sellingPrice: '', costPrice: '', existing: false };
 }
 
 function isChanged(row: Row) {
   if (row.existing && row.original) {
     const o = row.original;
-    return row.unit !== o.unit || row.stockQty !== o.stockQty || row.sellingPrice !== o.sellingPrice || row.costPrice !== o.costPrice;
+    return row.productType !== o.productType || row.unit !== o.unit || row.stockQty !== o.stockQty || row.sellingPrice !== o.sellingPrice || row.costPrice !== o.costPrice;
   }
-  // A new product needs a name and at least one number; untouched suggestions are skipped.
-  return !!row.name.trim() && !!(row.stockQty.trim() || row.sellingPrice.trim() || row.costPrice.trim());
+  // A new product needs a name and at least one number or a chosen type; untouched suggestions are skipped.
+  return !!row.name.trim() && !!(row.productType === 'PURCHASE' || row.stockQty.trim() || row.sellingPrice.trim() || row.costPrice.trim());
 }
 
 function numberOrNull(value: string) {
@@ -176,6 +180,7 @@ export default function ProductSheetModal({ visible, onClose, ownerId, apiFetch,
         name: row.name.trim(),
         // The sheet is the category of a new product; an existing product keeps its own.
         category: s.name,
+        productType: row.productType,
         unit: row.unit.trim() || null,
         stockQty: numberOrNull(row.stockQty),
         sellingPrice: numberOrNull(row.sellingPrice),
@@ -283,6 +288,7 @@ export default function ProductSheetModal({ visible, onClose, ownerId, apiFetch,
       }
       for (const fileRow of fileSheet.rows) {
         const values: Partial<Values> = {};
+        if (fileRow.productType) values.productType = fileRow.productType;
         if (fileRow.unit) values.unit = fileRow.unit;
         if (fileRow.stockQty !== null) values.stockQty = String(fileRow.stockQty);
         if (fileRow.sellingPrice !== null) values.sellingPrice = String(fileRow.sellingPrice);
@@ -311,6 +317,7 @@ export default function ProductSheetModal({ visible, onClose, ownerId, apiFetch,
   function renderRow({ item: row, index }: { item: Row; index: number }) {
     const changed = isChanged(row);
     const cellBg = changed ? '#FFF8D6' : index % 2 ? '#FAFBFC' : '#FFFFFF';
+    const isPurchase = row.productType === 'PURCHASE';
     const numberCell = (field: 'stockQty' | 'sellingPrice' | 'costPrice', width: number) => (
       <TextInput
         value={row[field]}
@@ -339,6 +346,15 @@ export default function ProductSheetModal({ visible, onClose, ownerId, apiFetch,
             style={[styles.cell, styles.input, { width: COL.name, backgroundColor: cellBg }]}
           />
         )}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${row.name || t('sheet_colProduct')} ${t('sheet_colType')}: ${t(isPurchase ? 'sheet_typePurchase' : 'sheet_typeSell')}`}
+          onPress={() => updateRow(row.key, { productType: isPurchase ? 'SELL' : 'PURCHASE' })}
+          style={[styles.cell, { width: COL.type, backgroundColor: cellBg, alignItems: 'center' }]}>
+          <View style={[styles.typePill, isPurchase ? styles.typePurchase : styles.typeSell]}>
+            <Text style={[styles.typeText, { color: isPurchase ? '#B45309' : '#047857' }]} numberOfLines={1}>{t(isPurchase ? 'sheet_typePurchase' : 'sheet_typeSell')}</Text>
+          </View>
+        </Pressable>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={`${row.name} ${t('sheet_colUnit')}`}
@@ -402,6 +418,7 @@ export default function ProductSheetModal({ visible, onClose, ownerId, apiFetch,
                   <View style={[styles.cell, styles.rowNumber, styles.headCell]} />
                   {([
                     ['sheet_colProduct', COL.name],
+                    ['sheet_colType', COL.type],
                     ['sheet_colUnit', COL.unit],
                     ['sheet_colStock', COL.stock],
                     ['sheet_colPrice', COL.price],
@@ -537,7 +554,7 @@ export default function ProductSheetModal({ visible, onClose, ownerId, apiFetch,
 
 const EXCEL_GREEN = '#107C41';
 
-const COL = { number: 32, name: 150, unit: 68, stock: 62, price: 68, cost: 64 };
+const COL = { number: 32, name: 130, type: 84, unit: 68, stock: 62, price: 68, cost: 64 };
 
 const palette = {
   navy: '#0F172A',
@@ -590,6 +607,10 @@ const styles = StyleSheet.create({
   headText: { fontSize: 11, fontWeight: '800', color: palette.slate },
   rowNumber: { width: COL.number, alignItems: 'center', backgroundColor: '#F1F3F5', paddingHorizontal: 0 },
   rowNumberText: { fontSize: 10, color: palette.muted, fontWeight: '700' },
+  typePill: { minHeight: 26, paddingHorizontal: 8, borderRadius: 999, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  typeSell: { backgroundColor: '#ECFDF5', borderColor: '#A7F3D0' },
+  typePurchase: { backgroundColor: '#FFFBEB', borderColor: '#FDE68A' },
+  typeText: { fontSize: 11, fontWeight: '800' },
   existingDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: EXCEL_GREEN },
   existingName: { flex: 1, fontSize: 13, fontWeight: '700', color: palette.navy },
   addRow: { paddingVertical: 12, paddingLeft: COL.number + 8, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: palette.grid },
