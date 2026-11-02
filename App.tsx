@@ -352,6 +352,7 @@ type InventoryItem = {
   // With a recipe, stockQty is what the ingredients can make and costPrice is what they cost.
   hasRecipe?: boolean;
   ingredientCount?: number;
+  ingredients?: { name: string; stockQty: number; unit: string }[];
   usedToday?: number;
 };
 
@@ -360,6 +361,11 @@ type ProductType = 'SELL' | 'PURCHASE';
 // Same rule as product_type_of() in the backend.
 function productTypeOf(item: InventoryItem): ProductType {
   return item.productType || 'SELL';
+}
+
+// Selling products are only sold and purchase products only bought; either can be written off as wastage.
+function canRecordEntry(item: InventoryItem, type: 'SALE' | 'PURCHASE' | 'WASTAGE') {
+  return type === 'WASTAGE' || productTypeOf(item) === (type === 'PURCHASE' ? 'PURCHASE' : 'SELL');
 }
 
 // Out of stock blocks selling, but a purchase or recipe product must stay selectable to edit or restock.
@@ -1094,6 +1100,8 @@ function CustomerAppContent() {
   const [useProduct, setUseProduct] = useState<InventoryItem | null>(null);
   const [foldedGrids, setFoldedGrids] = useState<Record<ProductType, boolean>>({ SELL: true, PURCHASE: true });
   const [productsView, setProductsView] = useState<'products' | 'purchases' | 'sales'>('products');
+  // The product being edited, when it is made from a recipe (stock and cost come from its ingredients).
+  const editingRecipeItem = editingProductId ? inventory.find(item => item.id === editingProductId && item.hasRecipe) || null : null;
   const [addProductLoading, setAddProductLoading] = useState(false);
 
   const [showUnitPicker, setShowUnitPicker] = useState(false);
@@ -3475,7 +3483,7 @@ function CustomerAppContent() {
   }
 
   function handleOpenRecordSale(item?: InventoryItem, type: 'SALE' | 'PURCHASE' | 'WASTAGE' = 'SALE', presetQty?: string) {
-    setSaleProductId(item ? item.id : (inventory[0]?.id || ''));
+    setSaleProductId(item && canRecordEntry(item, type) ? item.id : (inventory.find(p => canRecordEntry(p, type))?.id || ''));
     setSaleQuantity(presetQty || '');
     setSaleAmount('');
     setSalePaidNow('');
@@ -3738,10 +3746,10 @@ function CustomerAppContent() {
           name: newProductName.trim(),
           category: newProductCategory.trim() || 'General',
           unit: newProductUnit.trim() || 'kg',
-          stockQty: parseFloat(newProductStockQty) || 0,
+          // A recipe product's stock and cost are worked out from its ingredients, so they are not sent.
+          ...(editingRecipeItem ? {} : { stockQty: parseFloat(newProductStockQty) || 0, costPrice: parseFloat(newProductCostPrice) || 0 }),
           // A purchase product has no selling price field, so an edit must not record a ₹0 rate.
           ...(newProductType === 'SELL' ? { sellingPrice: parseFloat(newProductSellingPrice) || 0 } : {}),
-          costPrice: parseFloat(newProductCostPrice) || 0,
           lowStockThreshold: parseFloat(newProductLowStock) || 0,
           productType: newProductType,
         }),
@@ -10487,6 +10495,7 @@ function CustomerAppContent() {
                             style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: colors.redBorder, borderRadius: 6, backgroundColor: colors.redBg, opacity: deleteSelectedLoading ? 0.5 : 1 }}>
                             <Text style={{ fontSize: 12 }}>🗑️</Text>
                           </Pressable>
+                          {selectedInventoryRows.every(item => productTypeOf(item) === 'PURCHASE') && (
                           <Pressable
                             accessibilityRole="button"
                             accessibilityLabel={t('dc_recordPurchaseTitle')}
@@ -10495,6 +10504,7 @@ function CustomerAppContent() {
                             style={{ width: 26, height: 26, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: colors.amberBorder, borderRadius: 6, backgroundColor: colors.amberBg, opacity: selectedPurchaseSaving ? 0.5 : 1 }}>
                             <Text style={{ fontSize: 16, fontWeight: '800', color: colors.amber }}>+</Text>
                           </Pressable>
+                          )}
                         </>
                       )}
                     </View>
@@ -10582,6 +10592,16 @@ function CustomerAppContent() {
                                 </Pressable>
                               </View>
                             </View>
+                            {!!item.ingredients?.length && (
+                              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4, marginTop: 4 }} accessible accessibilityLabel={`${t('rcp_uses')}: ${item.ingredients.map(i => `${i.name} ${i.stockQty} ${i.unit}`).join(', ')}`}>
+                                <Text style={{ fontSize: 9, fontWeight: '700', color: colors.muted, alignSelf: 'center' }}>{t('rcp_uses')}:</Text>
+                                {item.ingredients.map(ingredient => (
+                                  <View key={ingredient.name} style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 999, borderWidth: 1, borderColor: ingredient.stockQty > 0 ? colors.amberBorder : colors.redBorder, backgroundColor: ingredient.stockQty > 0 ? colors.amberBg : colors.redBg }}>
+                                    <Text style={{ fontSize: 9, fontWeight: '700', color: ingredient.stockQty > 0 ? colors.amber : colors.red }}>{ingredient.name} {Math.round(ingredient.stockQty * 100) / 100} {ingredient.unit}</Text>
+                                  </View>
+                                ))}
+                              </View>
+                            )}
                             <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', columnGap: 8, marginTop: 3 }}>
                               <Text style={{ fontSize: 10, fontWeight: '700', color: colors.navy }}>
                                 {item.hasRecipe ? `${t('rcp_canMake', { count: item.stockQty })} · ${t('rcp_ingredients', { count: item.ingredientCount || 0 })}` : `${item.stockQty} ${item.unit}`}
@@ -17376,7 +17396,12 @@ function CustomerAppContent() {
 
               <View style={{ flexDirection: 'row', gap: 10 }}>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.fieldLabel}>{t(editingProductId ? 'inv_stockQtyLabel' : 'inv_openingStock')}</Text>
+                  <Text style={styles.fieldLabel}>{t(editingRecipeItem ? 'rcp_canMakeLabel' : editingProductId ? 'inv_stockQtyLabel' : 'inv_openingStock')}</Text>
+                  {editingRecipeItem ? (
+                    <View style={[styles.modalInput, { justifyContent: 'center', backgroundColor: colors.greenBg }]} accessible accessibilityLabel={`${t('rcp_canMakeLabel')}: ${editingRecipeItem.stockQty}`}>
+                      <Text style={{ fontSize: 15, fontWeight: '700', color: colors.greenDark }}>{editingRecipeItem.stockQty}</Text>
+                    </View>
+                  ) : (
                   <TextInput
                     keyboardType="numeric"
                     placeholder="e.g. 50"
@@ -17385,6 +17410,7 @@ function CustomerAppContent() {
                     value={newProductStockQty}
                     onChangeText={setNewProductStockQty}
                   />
+                  )}
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.fieldLabel}>{t('inv_lowStockAlert')}</Text>
@@ -17414,7 +17440,12 @@ function CustomerAppContent() {
                 </View>
                 )}
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.fieldLabel}>{t(newProductType === 'SELL' ? 'inv_costPrice' : 'inv_purchaseRate')}</Text>
+                  <Text style={styles.fieldLabel}>{t(editingRecipeItem ? 'rcp_costLabel' : newProductType === 'SELL' ? 'inv_costPrice' : 'inv_purchaseRate')}</Text>
+                  {editingRecipeItem ? (
+                    <View style={[styles.modalInput, { justifyContent: 'center', backgroundColor: colors.greenBg }]} accessible accessibilityLabel={`${t('rcp_costLabel')}: ₹${editingRecipeItem.costPrice}`}>
+                      <Text style={{ fontSize: 15, fontWeight: '700', color: colors.greenDark }}>₹{editingRecipeItem.costPrice}</Text>
+                    </View>
+                  ) : (
                   <TextInput
                     keyboardType="numeric"
                     placeholder="e.g. 90"
@@ -17423,8 +17454,17 @@ function CustomerAppContent() {
                     value={newProductCostPrice}
                     onChangeText={setNewProductCostPrice}
                   />
+                  )}
                 </View>
               </View>
+              {!!editingRecipeItem && (
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => { const item = editingRecipeItem; handleCloseProductForm(); setRecipeProduct(item); }}
+                  style={{ backgroundColor: colors.greenBg, borderColor: colors.greenBorder, borderWidth: 1, borderRadius: 10, padding: 10, marginBottom: 12 }}>
+                  <Text style={{ fontSize: 12, color: colors.greenDark }}>{t('rcp_fromRecipeHint')} <Text style={{ fontWeight: '800' }}>🧾 {t('rcp_editRecipe')} ›</Text></Text>
+                </Pressable>
+              )}
 
               {!!inventoryVoiceTranscript && (
                 <Pressable
@@ -17522,7 +17562,11 @@ function CustomerAppContent() {
                 {(['SALE', 'PURCHASE', 'WASTAGE'] as const).map(st => (
                   <Pressable
                     key={st}
-                    onPress={() => setSaleType(st)}
+                    onPress={() => {
+                      setSaleType(st);
+                      const current = inventory.find(p => p.id === saleProductId);
+                      if (!current || !canRecordEntry(current, st)) setSaleProductId(inventory.find(p => canRecordEntry(p, st))?.id || '');
+                    }}
                     style={[styles.modePill, saleType === st && styles.modePillActive]}>
                     <Text style={[styles.modePillText, saleType === st && styles.modePillTextActive]} numberOfLines={1}>
                       {st === 'SALE' ? `🧾 ${t('dc_sale')}` : st === 'PURCHASE' ? `📥 ${t('dc_purchase')}` : `🗑️ ${t('dc_wastage')}`}
@@ -17541,7 +17585,7 @@ function CustomerAppContent() {
               </Pressable>
               {showProductPicker && (
                 <View style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 8, marginTop: -6, marginBottom: 10, overflow: 'hidden' }}>
-                  {inventory.filter(p => saleType === 'PURCHASE' || productTypeOf(p) === 'SELL').map(p => (
+                  {inventory.filter(p => canRecordEntry(p, saleType)).map(p => (
                     <Pressable
                       key={p.id}
                       onPress={() => {

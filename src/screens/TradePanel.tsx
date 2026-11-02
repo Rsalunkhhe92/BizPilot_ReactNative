@@ -69,9 +69,8 @@ export default function TradePanel({ mode, ownerId, products, partyNames, apiFet
   const choices = useMemo(() => {
     const allowed = isSale
       ? products.filter(p => p.productType !== 'PURCHASE' && p.stockQty > 0)
-      // Purchase products first; a recipe product is made, not bought.
-      : products.filter(p => !p.hasRecipe);
-    return [...allowed].sort((a, b) => (isSale ? 0 : Number(b.productType === 'PURCHASE') - Number(a.productType === 'PURCHASE')) || a.name.localeCompare(b.name));
+      : products.filter(p => p.productType === 'PURCHASE');
+    return [...allowed].sort((a, b) => a.name.localeCompare(b.name));
   }, [products, isSale]);
 
   const list = entries || [];
